@@ -107,7 +107,8 @@ try {
     $batStatus = (($batOutput | Out-String).Trim()) | ConvertFrom-Json
     Assert-True ($batExit -eq 0 -and $batStatus.ExpectedProvider -eq 'cst_test') 'BAT launcher forwards quoted paths and noninteractive arguments'
 
-    if ($null -ne (Get-Command codex -ErrorAction SilentlyContinue)) {
+    if ($env:CST_RUN_CODEX_INTEGRATION -eq '1') {
+        if ($null -eq (Get-Command codex -ErrorAction SilentlyContinue)) { throw 'CST_RUN_CODEX_INTEGRATION=1 but the codex command is not installed.' }
         $realValidation = Invoke-Tool -Arguments @('-Action', 'Validate', '-ConfigPath', $freshConfig, '-NoPause')
         Assert-True ($realValidation.ExitCode -eq 0) 'Installed Codex performs a real bounded offline parse of an isolated valid config'
         $malformedHome = Join-Path $testRoot 'malformed-config'
@@ -117,7 +118,7 @@ try {
         $malformedValidation = Invoke-Tool -Arguments @('-Action', 'Validate', '-ConfigPath', $malformedConfig, '-NoPause')
         Assert-True ($malformedValidation.ExitCode -ne 0) 'Installed Codex rejects an isolated malformed TOML config'
     } else {
-        Write-Host '[SKIP] Codex command not installed; real offline parser checks skipped.' -ForegroundColor Yellow
+        Write-Host '[SKIP] Real Codex parser checks require CST_RUN_CODEX_INTEGRATION=1; isolated unit tests continue.' -ForegroundColor Yellow
     }
 
     $setContext = Invoke-Tool -Arguments @(

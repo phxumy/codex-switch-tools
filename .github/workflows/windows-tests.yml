@@ -12,11 +12,12 @@ jobs:
     runs-on: windows-latest
     timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - name: Run isolated config tests with Windows PowerShell 5.1
         shell: powershell
         run: ./tests/Run-Tests.ps1
       - name: Scan repository for committed secrets and private paths
+        if: always()
         shell: powershell
         run: ./tests/Test-RepositoryHygiene.ps1
 
@@ -24,10 +25,11 @@ jobs:
     runs-on: windows-latest
     timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - name: Run isolated config tests with PowerShell 7
         shell: pwsh
         run: ./tests/Run-Tests.ps1
       - name: Scan repository for committed secrets and private paths
+        if: always()
         shell: pwsh
         run: ./tests/Test-RepositoryHygiene.ps1

@@ -112,6 +112,8 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\tests\Run-Tests.ps1
 pwsh.exe -NoProfile -File .\tests\Run-Tests.ps1
 ```
 
+如本机已安装 Codex，并希望把真实的离线配置解析也纳入这次测试，可先设置当前进程变量 `$env:CST_RUN_CODEX_INTEGRATION = '1'`；默认 CI 不依赖预装 Codex。
+
 覆盖内容包括：
 
 - 全新电脑没有 `.codex` 或 `config.toml`；
