@@ -284,6 +284,14 @@ try {
         [IO.File]::AppendAllLines($env:GITHUB_STEP_SUMMARY, $summary, [Text.UTF8Encoding]::new($false))
     }
     if ($script:Failed -gt 0) { exit 1 }
+} catch {
+    if ($env:GITHUB_ACTIONS -eq 'true') {
+        $details = ($_.Exception.Message + ' | ' + $_.ScriptStackTrace)
+        if ($details.Length -gt 1500) { $details = $details.Substring(0, 1500) }
+        $escaped = $details.Replace('%', '%25').Replace("`r", '%0D').Replace("`n", '%0A')
+        Write-Output ('::error file=tests/Run-Tests.ps1,title=Unhandled compatibility-test exception::' + $escaped)
+    }
+    throw
 } finally {
     if ($KeepTemp) {
         Write-Host ('Kept test directory: ' + $testRoot)
