@@ -281,7 +281,8 @@ try {
             $summary += '## Failed assertions'
             foreach ($failure in $script:FailureMessages) { $summary += ('- ' + $failure) }
         }
-        [IO.File]::AppendAllLines($env:GITHUB_STEP_SUMMARY, $summary, [Text.UTF8Encoding]::new($false))
+        $summaryText = [string]::Join([Environment]::NewLine, $summary) + [Environment]::NewLine
+        [IO.File]::AppendAllText($env:GITHUB_STEP_SUMMARY, $summaryText)
     }
     if ($script:Failed -gt 0) { exit 1 }
 } catch {
