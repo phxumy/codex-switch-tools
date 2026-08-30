@@ -1,0 +1,25 @@
+name: Windows compatibility tests
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  smoke-tests:
+    runs-on: windows-latest
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        shell: [powershell, pwsh]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Run isolated config tests
+        shell: ${{ matrix.shell }}
+        run: ./tests/Run-Tests.ps1
+      - name: Scan repository for committed secrets and private paths
+        shell: ${{ matrix.shell }}
+        run: ./tests/Test-RepositoryHygiene.ps1
