@@ -8,18 +8,26 @@ permissions:
   contents: read
 
 jobs:
-  smoke-tests:
+  windows-powershell-5:
     runs-on: windows-latest
     timeout-minutes: 10
-    strategy:
-      fail-fast: false
-      matrix:
-        shell: [powershell, pwsh]
     steps:
       - uses: actions/checkout@v4
-      - name: Run isolated config tests
-        shell: ${{ matrix.shell }}
+      - name: Run isolated config tests with Windows PowerShell 5.1
+        shell: powershell
         run: ./tests/Run-Tests.ps1
       - name: Scan repository for committed secrets and private paths
-        shell: ${{ matrix.shell }}
+        shell: powershell
+        run: ./tests/Test-RepositoryHygiene.ps1
+
+  powershell-7:
+    runs-on: windows-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - name: Run isolated config tests with PowerShell 7
+        shell: pwsh
+        run: ./tests/Run-Tests.ps1
+      - name: Scan repository for committed secrets and private paths
+        shell: pwsh
         run: ./tests/Test-RepositoryHygiene.ps1
