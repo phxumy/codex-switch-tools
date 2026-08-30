@@ -13,12 +13,18 @@ $tempParent = [IO.Path]::GetFullPath([IO.Path]::GetTempPath())
 $testRoot = Join-Path $tempParent ('codex-switch-tools-tests-' + [guid]::NewGuid().ToString('N'))
 $script:Passed = 0
 $script:Failed = 0
+$script:FailureMessages = [System.Collections.Generic.List[string]]::new()
 
 function Assert-True {
     param([bool]$Condition, [string]$Message)
     if (-not $Condition) {
         $script:Failed++
+        [void]$script:FailureMessages.Add($Message)
         Write-Host ('[FAIL] ' + $Message) -ForegroundColor Red
+        if ($env:GITHUB_ACTIONS -eq 'true') {
+            $escaped = $Message.Replace('%', '%25').Replace("`r", '%0D').Replace("`n", '%0A')
+            Write-Output ('::error file=tests/Run-Tests.ps1,title=Compatibility test failed::' + $escaped)
+        }
     } else {
         $script:Passed++
         Write-Host ('[PASS] ' + $Message) -ForegroundColor Green
@@ -268,6 +274,15 @@ try {
 
     Write-Host ''
     Write-Host ("RESULT: {0} passed, {1} failed" -f $script:Passed, $script:Failed)
+    if (-not [string]::IsNullOrWhiteSpace($env:GITHUB_STEP_SUMMARY)) {
+        $summary = @('# Codex Switch Tools test result', '', ("- Passed: {0}" -f $script:Passed), ("- Failed: {0}" -f $script:Failed))
+        if ($script:FailureMessages.Count -gt 0) {
+            $summary += ''
+            $summary += '## Failed assertions'
+            foreach ($failure in $script:FailureMessages) { $summary += ('- ' + $failure) }
+        }
+        [IO.File]::AppendAllLines($env:GITHUB_STEP_SUMMARY, $summary, [Text.UTF8Encoding]::new($false))
+    }
     if ($script:Failed -gt 0) { exit 1 }
 } finally {
     if ($KeepTemp) {
