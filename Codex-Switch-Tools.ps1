@@ -1,6 +1,6 @@
-[CmdletBinding()]
+﻿[CmdletBinding()]
 param(
-    [ValidateSet('Menu', 'Status', 'UseOpenAI', 'ConfigureProvider', 'SetProvider', 'SetContext', 'ResetContext', 'ToggleLongContext', 'MigrateLegacySecret', 'Validate')]
+    [ValidateSet('Menu', 'Status', 'UseOpenAI', 'ConfigureProvider', 'SetProvider', 'SetContext', 'ResetContext', 'ToggleLongContext', 'MigrateLegacySecret', 'SetApiKey', 'RemoveApiKey', 'ListBackups', 'RestoreBackup', 'DirectProbe', 'Validate')]
     [string]$Action = 'Menu',
     [string]$ConfigPath,
     [string]$ProviderId,
@@ -9,6 +9,7 @@ param(
     [string]$EnvKey,
     [string]$Model,
     [string]$ReasoningEffort,
+    [string]$BackupName,
     [Nullable[long]]$ContextWindow,
     [Nullable[long]]$AutoCompactLimit,
     [ValidateSet('User')]
@@ -16,6 +17,11 @@ param(
     [switch]$NoAuth,
     [switch]$ForceRemoveUnmanagedContext,
     [switch]$ForceOverwriteEnvironmentVariable,
+    [switch]$ForceOverwriteApiKey,
+    [switch]$ReadSecretFromStdin,
+    [switch]$ForceRemoveApiKey,
+    [switch]$ConfirmDirectProbe,
+    [switch]$ConfirmRestoreBackup,
     [switch]$NoPause,
     [switch]$SkipCodexValidation,
     [switch]$Json
@@ -23,8 +29,9 @@ param(
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
+try { [Console]::OutputEncoding = [Text.UTF8Encoding]::new($false) } catch { }
 
-$script:ToolVersion = '1.0.0'
+$script:ToolVersion = '1.1.0'
 $script:EntryExitCode = 0
 $script:ContextMarkerPattern = '^\s*#\s*CST_CONTEXT_V1\s+previous_window=(absent|[0-9_]+)\s+previous_compact=(absent|[0-9_]+)\s*$'
 $script:ReservedProviderIds = @('openai', 'ollama', 'lmstudio')
@@ -575,6 +582,13 @@ function Ensure-ProviderDefinition {
 
     $block = Get-ProviderBlock -Document $Document -Id $Id
     if ($null -ne $block) {
+        if (Test-ProviderHasAdvancedRequestConfig -Document $Document -Id $Id) {
+            throw "Provider '$Id' uses advanced headers or query parameters. This tool will not overwrite that advanced provider definition."
+        }
+        $openAiAuthEntry = Get-TableEntry -Document $Document -Block $block -Key 'requires_openai_auth'
+        if ($null -ne $openAiAuthEntry -and (ConvertFrom-SimpleTomlString -RawValue $openAiAuthEntry.RawValue) -eq 'true') {
+            throw "Provider '$Id' uses OpenAI-managed authentication. This tool will not convert it to env_key/no-auth automatically."
+        }
         $legacyToken = Get-TableEntry -Document $Document -Block $block -Key 'experimental_bearer_token'
         if ($null -ne $legacyToken) {
             throw "Provider '$Id' contains a legacy inline token. Use API-key and legacy-secret tools to migrate it before updating this provider."
@@ -861,12 +875,17 @@ function Get-AllProviderDefinitions {
 function Get-EnvironmentStatus {
     param([string]$Name)
     if ([string]::IsNullOrWhiteSpace($Name)) {
-        return [pscustomobject]@{ Name = $null; Process = $false; User = $false; Machine = $false; Any = $false }
+        return [pscustomobject]@{ Name = $null; Process = $false; User = $false; Machine = $false; Any = $false; ProcessUserConflict = $false }
     }
-    $processPresent = -not [string]::IsNullOrWhiteSpace([Environment]::GetEnvironmentVariable($Name, 'Process'))
-    $userPresent = -not [string]::IsNullOrWhiteSpace([Environment]::GetEnvironmentVariable($Name, 'User'))
-    $machinePresent = -not [string]::IsNullOrWhiteSpace([Environment]::GetEnvironmentVariable($Name, 'Machine'))
-    return [pscustomobject]@{ Name = $Name; Process = $processPresent; User = $userPresent; Machine = $machinePresent; Any = ($processPresent -or $userPresent -or $machinePresent) }
+    $processValue = [Environment]::GetEnvironmentVariable($Name, 'Process')
+    $userValue = [Environment]::GetEnvironmentVariable($Name, 'User')
+    $machineValue = [Environment]::GetEnvironmentVariable($Name, 'Machine')
+    $processPresent = -not [string]::IsNullOrWhiteSpace($processValue)
+    $userPresent = -not [string]::IsNullOrWhiteSpace($userValue)
+    $machinePresent = -not [string]::IsNullOrWhiteSpace($machineValue)
+    $conflict = $processPresent -and $userPresent -and $processValue -cne $userValue
+    Remove-Variable processValue, userValue, machineValue -ErrorAction SilentlyContinue
+    return [pscustomobject]@{ Name = $Name; Process = $processPresent; User = $userPresent; Machine = $machinePresent; Any = ($processPresent -or $userPresent -or $machinePresent); ProcessUserConflict = $conflict }
 }
 
 function Get-ContextMarker {
@@ -995,6 +1014,11 @@ function Get-StatusObject {
             WireApi = $definition.WireApi
             EnvKey = $definition.EnvKey
             EnvKeyPresent = $envStatus.Any
+            EnvKeyProcessPresent = $envStatus.Process
+            EnvKeyUserPresent = $envStatus.User
+            EnvKeyMachinePresent = $envStatus.Machine
+            EnvKeyProcessUserConflict = $envStatus.ProcessUserConflict
+            RequiresOpenAIAuth = $definition.RequiresOpenAIAuth
             HasInlineSecret = $definition.HasInlineSecret
             HasCommandAuth = $definition.HasCommandAuth
             HasAdvancedRequestConfig = $definition.HasAdvancedRequestConfig
@@ -1013,6 +1037,7 @@ function Get-StatusObject {
         if (-not [string]::IsNullOrWhiteSpace($activeDefinition.EnvKey)) {
             $envStatus = Get-EnvironmentStatus -Name $activeDefinition.EnvKey
             if (-not $envStatus.Any) { [void]$warnings.Add("API-key environment variable '$($activeDefinition.EnvKey)' is missing.") }
+            elseif ($envStatus.ProcessUserConflict) { [void]$warnings.Add("API-key environment variable '$($activeDefinition.EnvKey)' differs between the current Process and User scopes. Restart the launcher/Codex to avoid using a stale key.") }
         }
     }
     if (-not [string]::IsNullOrWhiteSpace($catalogPath)) {
@@ -1224,27 +1249,79 @@ function Read-SecretValue {
     }
 }
 
-function Save-ApiKeyInteractive {
-    param([string]$Name, [string]$Target = 'User')
+function Set-CstEnvironmentVariable {
+    param([string]$Name, [AllowNull()]$Value, [string]$Target)
+    if ($Target -eq 'User' -and $null -eq $Value) {
+        $key = [Microsoft.Win32.Registry]::CurrentUser.OpenSubKey('Environment', $true)
+        try { if ($null -ne $key) { $key.DeleteValue($Name, $false) } }
+        finally { if ($null -ne $key) { $key.Dispose() } }
+        return
+    }
+    [Environment]::SetEnvironmentVariable($Name, [string]$Value, $Target)
+}
+
+function Save-ApiKeyValue {
+    param([string]$Name, [string]$PlainValue, [string]$Target = 'User', [bool]$AllowOverwrite = $false)
     Assert-EnvironmentName -Name $Name
-    Write-Host 'The key is hidden while typing. User-scope environment variables are stored by Windows for this account.' -ForegroundColor Yellow
-    $plain = Read-SecretValue -Prompt ('Paste API key for ' + $Name)
+    if ([string]::IsNullOrWhiteSpace($PlainValue)) { throw 'API key cannot be empty.' }
     $previousTarget = [Environment]::GetEnvironmentVariable($Name, $Target)
     $previousProcess = [Environment]::GetEnvironmentVariable($Name, 'Process')
+    if (-not [string]::IsNullOrWhiteSpace($previousTarget) -and $previousTarget -cne $PlainValue -and -not $AllowOverwrite) {
+        throw "Environment variable '$Name' already contains a different value. Refusing to overwrite it without explicit confirmation."
+    }
     try {
-        [Environment]::SetEnvironmentVariable($Name, $plain, $Target)
-        [Environment]::SetEnvironmentVariable($Name, $plain, 'Process')
+        Set-CstEnvironmentVariable -Name $Name -Value $PlainValue -Target $Target
+        [Environment]::SetEnvironmentVariable($Name, $PlainValue, 'Process')
     } catch {
-        [Environment]::SetEnvironmentVariable($Name, $previousTarget, $Target)
+        Set-CstEnvironmentVariable -Name $Name -Value $previousTarget -Target $Target
         [Environment]::SetEnvironmentVariable($Name, $previousProcess, 'Process')
         throw
     } finally {
-        Remove-Variable plain -ErrorAction SilentlyContinue
         Remove-Variable previousTarget -ErrorAction SilentlyContinue
         Remove-Variable previousProcess -ErrorAction SilentlyContinue
     }
     Write-Host ('[OK] Saved ' + $Name + ' at ' + $Target + ' scope (value hidden).') -ForegroundColor Green
     Write-Host 'Restart Codex / VS Code so the new process inherits it.' -ForegroundColor Yellow
+}
+
+function Save-ApiKeyInteractive {
+    param([string]$Name, [string]$Target = 'User')
+    Assert-EnvironmentName -Name $Name
+    Write-Host 'The key is hidden while typing. User-scope environment variables are stored by Windows for this account.' -ForegroundColor Yellow
+    $plain = Read-SecretValue -Prompt ('Paste API key for ' + $Name)
+    $allowOverwrite = $false
+    $existing = [Environment]::GetEnvironmentVariable($Name, $Target)
+    if (-not [string]::IsNullOrWhiteSpace($existing) -and $existing -cne $plain) {
+        $confirm = Read-Host ('Type the exact variable name to overwrite it: ' + $Name)
+        if ($confirm -cne $Name) { Remove-Variable plain -ErrorAction SilentlyContinue; throw 'API key update cancelled.' }
+        $allowOverwrite = $true
+    }
+    try {
+        Save-ApiKeyValue -Name $Name -PlainValue $plain -Target $Target -AllowOverwrite $allowOverwrite
+    } finally {
+        Remove-Variable plain -ErrorAction SilentlyContinue
+        Remove-Variable existing -ErrorAction SilentlyContinue
+    }
+}
+
+function Remove-ApiKeyValue {
+    param([string]$Name, [string]$Target = 'User')
+    Assert-EnvironmentName -Name $Name
+    $previousTarget = [Environment]::GetEnvironmentVariable($Name, $Target)
+    $previousProcess = [Environment]::GetEnvironmentVariable($Name, 'Process')
+    try {
+        Set-CstEnvironmentVariable -Name $Name -Value $null -Target $Target
+        [Environment]::SetEnvironmentVariable($Name, $null, 'Process')
+    } catch {
+        Set-CstEnvironmentVariable -Name $Name -Value $previousTarget -Target $Target
+        [Environment]::SetEnvironmentVariable($Name, $previousProcess, 'Process')
+        throw
+    } finally {
+        Remove-Variable previousTarget -ErrorAction SilentlyContinue
+        Remove-Variable previousProcess -ErrorAction SilentlyContinue
+    }
+    Write-Host ('[OK] Removed ' + $Name + ' from ' + $Target + ' scope (value was never shown).') -ForegroundColor Green
+    Write-Host 'Restart Codex / VS Code so new processes observe the change.' -ForegroundColor Yellow
 }
 
 function Invoke-MigrateLegacySecretOperation {
@@ -1280,14 +1357,14 @@ function Invoke-MigrateLegacySecretOperation {
         throw "Environment variable '$EnvironmentKey' already contains a different value. Refusing to overwrite it without explicit confirmation."
     }
     try {
-        [Environment]::SetEnvironmentVariable($EnvironmentKey, $plain, $Target)
+        Set-CstEnvironmentVariable -Name $EnvironmentKey -Value $plain -Target $Target
         [Environment]::SetEnvironmentVariable($EnvironmentKey, $plain, 'Process')
         Set-ProviderRawValue -Document $document -Id $Id -Key 'env_key' -RawValue (ConvertTo-TomlString -Value $EnvironmentKey)
         Remove-ProviderKey -Document $document -Id $Id -Key 'experimental_bearer_token'
         $result = Save-ConfigDocument -Document $document -Operation ('Migrate inline token for provider ' + $Id + ' to environment variable ' + $EnvironmentKey)
         Show-SaveResult -Result $result
     } catch {
-        [Environment]::SetEnvironmentVariable($EnvironmentKey, $previous, $Target)
+        Set-CstEnvironmentVariable -Name $EnvironmentKey -Value $previous -Target $Target
         [Environment]::SetEnvironmentVariable($EnvironmentKey, $previousProcess, 'Process')
         throw
     } finally {
@@ -1362,6 +1439,7 @@ function Restore-BackupRecord {
         }
         Write-Host ('[OK] Restored backup: ' + $Record.Directory) -ForegroundColor Green
         Write-Host ('Safety backup of previous live config: ' + $safetyDirectory)
+        Write-Host ('Validation: ' + $validation.Message)
         Write-Host 'Fully quit and reopen Codex / VS Code.' -ForegroundColor Yellow
     } catch {
         $originalError = $_
@@ -1387,17 +1465,19 @@ function Restore-BackupRecord {
 
 function Install-DesktopShortcut {
     $batPath = Join-Path $PSScriptRoot 'Codex-Switch-Tools.bat'
-    if (-not (Test-Path -LiteralPath $batPath -PathType Leaf)) { throw "Launcher not found: $batPath" }
+    $guiPath = Join-Path $PSScriptRoot 'dist\CodexSwitchTools.exe'
+    $targetPath = if (Test-Path -LiteralPath $guiPath -PathType Leaf) { $guiPath } else { $batPath }
+    if (-not (Test-Path -LiteralPath $targetPath -PathType Leaf)) { throw "Launcher not found: $targetPath" }
     $desktop = [Environment]::GetFolderPath('Desktop')
     if ([string]::IsNullOrWhiteSpace($desktop) -or -not (Test-Path -LiteralPath $desktop -PathType Container)) { throw 'Cannot resolve the desktop directory.' }
-    $shortcutPath = Join-Path $desktop 'Codex Switch Tools.lnk'
+    $shortcutPath = Join-Path $desktop 'Codex 切换工具.lnk'
     $shell = New-Object -ComObject WScript.Shell
     try {
         $shortcut = $shell.CreateShortcut($shortcutPath)
-        $shortcut.TargetPath = $batPath
-        $shortcut.WorkingDirectory = $PSScriptRoot
-        $shortcut.Description = 'Switch Codex provider, model and context settings'
-        $shortcut.IconLocation = (Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe') + ',0'
+        $shortcut.TargetPath = $targetPath
+        $shortcut.WorkingDirectory = Split-Path -Parent $targetPath
+        $shortcut.Description = '中文 Codex Provider、模型、上下文、密钥与备份配置工具'
+        $shortcut.IconLocation = if ($targetPath.EndsWith('.exe', [StringComparison]::OrdinalIgnoreCase)) { $targetPath + ',0' } else { (Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe') + ',0' }
         $shortcut.WindowStyle = 1
         $shortcut.Save()
     } finally {
@@ -1692,9 +1772,7 @@ function Invoke-ApiKeyMenu {
             Write-Host 'Environment variables are not included in config backups.' -ForegroundColor Yellow
             $confirm = Read-Host ('Type the exact variable name to remove it: ' + $definition.EnvKey)
             if ($confirm -cne $definition.EnvKey) { Write-Host 'Cancelled.'; return }
-            [Environment]::SetEnvironmentVariable($definition.EnvKey, $null, 'User')
-            [Environment]::SetEnvironmentVariable($definition.EnvKey, $null, 'Process')
-            Write-Host ('[OK] Removed User-scope variable ' + $definition.EnvKey + '.') -ForegroundColor Green
+            Remove-ApiKeyValue -Name $definition.EnvKey -Target 'User'
         }
         '0' { return }
         default { throw 'Invalid selection.' }
@@ -1787,6 +1865,49 @@ function Invoke-EntryPoint {
             'MigrateLegacySecret' {
                 if ([string]::IsNullOrWhiteSpace($ProviderId)) { throw 'MigrateLegacySecret requires -ProviderId.' }
                 Invoke-MigrateLegacySecretOperation -Id $ProviderId -EnvironmentKey $EnvKey -Target $EnvironmentTarget -AllowEnvironmentOverwrite ([bool]$ForceOverwriteEnvironmentVariable)
+            }
+            'SetApiKey' {
+                if ([string]::IsNullOrWhiteSpace($EnvKey)) { throw 'SetApiKey requires -EnvKey.' }
+                if (-not $ReadSecretFromStdin) { throw 'SetApiKey requires -ReadSecretFromStdin so the key is never placed on the command line.' }
+                $plain = [Console]::In.ReadToEnd()
+                if ($null -ne $plain) { $plain = $plain.TrimEnd([char[]]@("`r", "`n")) }
+                try { Save-ApiKeyValue -Name $EnvKey -PlainValue $plain -Target 'User' -AllowOverwrite ([bool]$ForceOverwriteApiKey) }
+                finally { Remove-Variable plain -ErrorAction SilentlyContinue }
+            }
+            'RemoveApiKey' {
+                if ([string]::IsNullOrWhiteSpace($EnvKey)) { throw 'RemoveApiKey requires -EnvKey.' }
+                if (-not $ForceRemoveApiKey) { throw 'RemoveApiKey requires -ForceRemoveApiKey after explicit user confirmation.' }
+                $document = Read-ConfigDocument
+                $references = @((Get-AllProviderDefinitions -Document $document) | Where-Object { $_.EnvKey -ieq $EnvKey } | Select-Object -ExpandProperty Id)
+                if ($references.Count -gt 1) { Write-Warning ('Environment variable is shared by providers: ' + ($references -join ', ')) }
+                Remove-ApiKeyValue -Name $EnvKey -Target 'User'
+            }
+            'ListBackups' {
+                $safeRecords = @((Get-BackupRecords) | ForEach-Object {
+                    [pscustomobject]@{
+                        Name = $_.Name
+                        Operation = $_.Operation
+                        ContainsLegacyInlineSecret = $_.ContainsLegacyInlineSecret
+                    }
+                })
+                if ($Json) { Write-Output (ConvertTo-Json -InputObject $safeRecords -Depth 4) }
+                else {
+                    foreach ($record in $safeRecords) {
+                        $warning = if ($record.ContainsLegacyInlineSecret) { ' [contains legacy inline token]' } else { '' }
+                        Write-Host ($record.Name + ' | ' + $record.Operation + $warning)
+                    }
+                }
+            }
+            'RestoreBackup' {
+                if ([string]::IsNullOrWhiteSpace($BackupName)) { throw 'RestoreBackup requires -BackupName.' }
+                if (-not $ConfirmRestoreBackup) { throw 'RestoreBackup requires -ConfirmRestoreBackup after explicit user confirmation.' }
+                $matches = @((Get-BackupRecords) | Where-Object { $_.Name -ceq $BackupName })
+                if ($matches.Count -ne 1) { throw "Backup '$BackupName' was not found or was ambiguous." }
+                Restore-BackupRecord -Record $matches[0]
+            }
+            'DirectProbe' {
+                if (-not $ConfirmDirectProbe) { throw 'DirectProbe requires -ConfirmDirectProbe after explicit user confirmation.' }
+                Invoke-LiveProbe -Confirmed $true
             }
             'Validate' {
                 [void](Read-ConfigDocument)

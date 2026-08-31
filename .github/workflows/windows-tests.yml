@@ -51,3 +51,12 @@ jobs:
         if: always()
         shell: pwsh
         run: ./tests/Test-RepositoryHygiene.ps1
+
+  gui-build-smoke:
+    runs-on: windows-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v5
+      - name: Build and self-test the Chinese WinForms executable
+        shell: powershell
+        run: ./tests/Test-GuiSmoke.ps1

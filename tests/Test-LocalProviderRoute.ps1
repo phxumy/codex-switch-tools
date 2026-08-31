@@ -77,12 +77,10 @@ try {
     $directBaseUrl = 'http://127.0.0.1:' + $directReady.port + '/v1'
     $directConfigure = & $enginePath -NoLogo -NoProfile -ExecutionPolicy Bypass -File $tool -Action ConfigureProvider -ConfigPath $configPath -ProviderId cst_mock -ProviderName 'CST Local Mock' -BaseUrl $directBaseUrl -EnvKey CST_MOCK_API_KEY -NoPause 2>&1
     if ($LASTEXITCODE -ne 0) { throw ('Direct-probe provider update failed: ' + (($directConfigure | Out-String).Trim())) }
-    . $tool -ConfigPath $configPath -NoPause
-    $directProbeSucceeded = $true
-    $directProbeOutput = ''
-    try { $directProbeOutput = (& { Invoke-LiveProbe -Confirmed $true } *>&1 | Out-String) }
-    catch { $directProbeSucceeded = $false; $directProbeOutput = ($_ | Out-String) }
-    if (-not $directProbeSucceeded) { throw ('Direct Responses probe failed: ' + $directProbeOutput.Trim()) }
+    $directProbeOutput = & $enginePath -NoLogo -NoProfile -ExecutionPolicy Bypass -File $tool -Action DirectProbe -ConfigPath $configPath -ConfirmDirectProbe -NoPause 2>&1
+    $directProbeExit = $LASTEXITCODE
+    $directProbeOutput = ($directProbeOutput | Out-String)
+    if ($directProbeExit -ne 0) { throw ('Direct Responses probe failed: ' + $directProbeOutput.Trim()) }
     if ($directProbeOutput -notmatch '\[OK\] Direct Responses API probe completed') { throw 'Direct probe did not report a validated Responses-shaped success.' }
     $directResult = [IO.File]::ReadAllText($directResultFile) | ConvertFrom-Json
     if ($directResult.path -ne '/v1/responses' -or $directResult.model -ne 'cst-mock-model' -or -not $directResult.authorization_matches_expected_dummy) {

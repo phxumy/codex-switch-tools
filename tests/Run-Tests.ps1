@@ -14,6 +14,7 @@ $testRoot = Join-Path $tempParent ('codex-switch-tools-tests-' + [guid]::NewGuid
 $script:Passed = 0
 $script:Failed = 0
 $script:FailureMessages = [System.Collections.Generic.List[string]]::new()
+$script:UserEnvironmentCleanup = [System.Collections.Generic.List[string]]::new()
 
 function Assert-True {
     param([bool]$Condition, [string]$Message)
@@ -32,7 +33,7 @@ function Assert-True {
 }
 
 function Invoke-Tool {
-    param([string[]]$Arguments, [switch]$ForceValidationFailure, [switch]$ForceValidationException, [string]$CodexHome)
+    param([string[]]$Arguments, [switch]$ForceValidationFailure, [switch]$ForceValidationException, [string]$CodexHome, [string]$StandardInput)
     $oldFailureFlag = $env:CODEX_SWITCH_TEST_FAIL_VALIDATION
     $oldThrowFlag = $env:CODEX_SWITCH_TEST_THROW_VALIDATION
     $oldCodexHome = $env:CODEX_HOME
@@ -42,7 +43,11 @@ function Invoke-Tool {
         if ($ForceValidationException) { $env:CODEX_SWITCH_TEST_THROW_VALIDATION = '1' }
         else { Remove-Item Env:CODEX_SWITCH_TEST_THROW_VALIDATION -ErrorAction SilentlyContinue }
         if (-not [string]::IsNullOrWhiteSpace($CodexHome)) { $env:CODEX_HOME = $CodexHome }
-        $output = & $engine -NoLogo -NoProfile -ExecutionPolicy Bypass -File $tool @Arguments 2>&1
+        if ($null -eq $StandardInput) {
+            $output = & $engine -NoLogo -NoProfile -ExecutionPolicy Bypass -File $tool @Arguments 2>&1
+        } else {
+            $output = $StandardInput | & $engine -NoLogo -NoProfile -ExecutionPolicy Bypass -File $tool @Arguments 2>&1
+        }
         return [pscustomobject]@{ ExitCode = $LASTEXITCODE; Output = (($output | Out-String).Trim()) }
     } finally {
         if ($null -eq $oldFailureFlag) { Remove-Item Env:CODEX_SWITCH_TEST_FAIL_VALIDATION -ErrorAction SilentlyContinue }
@@ -106,6 +111,32 @@ try {
     $statusObject = $status.Output | ConvertFrom-Json
     Assert-True ($status.ExitCode -eq 0 -and $statusObject.ExpectedProvider -eq 'cst_test') 'JSON diagnostics reports expected provider without a live request'
     Assert-True ($statusObject.RequestedModel -eq 'fixture-model-v1') 'JSON diagnostics reports requested model'
+
+    $guiEnvName = 'CST_GUI_TEST_' + [guid]::NewGuid().ToString('N').ToUpperInvariant()
+    [void]$script:UserEnvironmentCleanup.Add($guiEnvName)
+    $fakeGuiKey = 'CST_GUI_FAKE_KEY_VALUE'
+    $escapedGuiKey = [regex]::Escape($fakeGuiKey)
+    $setKey = Invoke-Tool -StandardInput $fakeGuiKey -Arguments @('-Action', 'SetApiKey', '-ConfigPath', $freshConfig, '-EnvKey', $guiEnvName, '-ReadSecretFromStdin', '-SkipCodexValidation', '-NoPause')
+    $savedGuiKey = [Environment]::GetEnvironmentVariable($guiEnvName, 'User')
+    Assert-True ($setKey.ExitCode -eq 0 -and $savedGuiKey -ceq $fakeGuiKey) 'GUI-safe stdin action stores an API key without using command-line arguments'
+    Assert-True ($setKey.Output -notmatch $escapedGuiKey) 'SetApiKey output never echoes the stdin key'
+    $replacementGuiKey = 'CST_GUI_REPLACEMENT_KEY_VALUE'
+    $overwriteDenied = Invoke-Tool -StandardInput $replacementGuiKey -Arguments @('-Action', 'SetApiKey', '-ConfigPath', $freshConfig, '-EnvKey', $guiEnvName, '-ReadSecretFromStdin', '-SkipCodexValidation', '-NoPause')
+    Assert-True ($overwriteDenied.ExitCode -ne 0 -and [Environment]::GetEnvironmentVariable($guiEnvName, 'User') -ceq $fakeGuiKey) 'SetApiKey refuses to overwrite a different User value without explicit force'
+    $overwriteAllowed = Invoke-Tool -StandardInput $replacementGuiKey -Arguments @('-Action', 'SetApiKey', '-ConfigPath', $freshConfig, '-EnvKey', $guiEnvName, '-ReadSecretFromStdin', '-ForceOverwriteApiKey', '-SkipCodexValidation', '-NoPause')
+    Assert-True ($overwriteAllowed.ExitCode -eq 0 -and [Environment]::GetEnvironmentVariable($guiEnvName, 'User') -ceq $replacementGuiKey) 'SetApiKey overwrites only after explicit force confirmation'
+    $scopeProviderCreate = Invoke-Tool -Arguments @('-Action', 'ConfigureProvider', '-ConfigPath', $freshConfig, '-ProviderId', 'cst_scope_test', '-ProviderName', 'Scope Test', '-BaseUrl', 'http://127.0.0.1:56789/v1', '-EnvKey', $guiEnvName, '-SkipCodexValidation', '-NoPause')
+    [Environment]::SetEnvironmentVariable($guiEnvName, 'CST_GUI_STALE_PROCESS_KEY', 'Process')
+    $scopeStatus = Invoke-Tool -Arguments @('-Action', 'Status', '-ConfigPath', $freshConfig, '-Json', '-SkipCodexValidation', '-NoPause')
+    $scopeObject = $scopeStatus.Output | ConvertFrom-Json
+    $scopeProvider = @($scopeObject.Providers | Where-Object { $_.EnvKey -eq $guiEnvName })
+    Assert-True ($scopeProviderCreate.ExitCode -eq 0 -and $scopeProvider.Count -eq 1 -and $scopeProvider[0].EnvKeyUserPresent -and $scopeProvider[0].EnvKeyProcessPresent -and $scopeProvider[0].EnvKeyProcessUserConflict) 'Status reports User/Process scope presence and stale-key conflicts without exposing values'
+    [Environment]::SetEnvironmentVariable($guiEnvName, $null, 'Process')
+    $removeKey = Invoke-Tool -Arguments @('-Action', 'RemoveApiKey', '-ConfigPath', $freshConfig, '-EnvKey', $guiEnvName, '-ForceRemoveApiKey', '-SkipCodexValidation', '-NoPause')
+    $registryEnvironment = [Microsoft.Win32.Registry]::CurrentUser.OpenSubKey('Environment', $false)
+    try { $registryValueAbsent = $null -eq $registryEnvironment -or $registryEnvironment.GetValueNames() -notcontains $guiEnvName }
+    finally { if ($null -ne $registryEnvironment) { $registryEnvironment.Dispose() } }
+    Assert-True ($removeKey.ExitCode -eq 0 -and [string]::IsNullOrWhiteSpace([Environment]::GetEnvironmentVariable($guiEnvName, 'User')) -and $registryValueAbsent) 'GUI RemoveApiKey action deletes the User registry value only after explicit force confirmation'
 
     $bat = Join-Path $repoRoot 'Codex-Switch-Tools.bat'
     $batOutput = & $bat -Action Status -ConfigPath $freshConfig -Json -SkipCodexValidation -NoPause 2>&1
@@ -215,6 +246,15 @@ try {
     $quotedEdit = Invoke-Tool -Arguments @('-Action', 'SetProvider', '-ConfigPath', $quotedConfig, '-ProviderId', 'cst_quoted', '-Model', 'safe-model', '-SkipCodexValidation', '-NoPause')
     Assert-True ($quotedEdit.ExitCode -ne 0 -and (Get-FileHash -Algorithm SHA256 -LiteralPath $quotedConfig).Hash -eq $quotedHash) 'Quoted logical root keys are refused to prevent duplicate TOML keys'
 
+    $advancedHome = Join-Path $testRoot 'advanced-auth-fixture'
+    New-Item -ItemType Directory -Path $advancedHome | Out-Null
+    $advancedConfig = Join-Path $advancedHome 'config.toml'
+    $advancedText = @('[model_providers.cst_advanced]', 'name = "Advanced"', 'base_url = "https://example.invalid/v1"', 'wire_api = "responses"', 'requires_openai_auth = true', '') -join "`n"
+    [IO.File]::WriteAllText($advancedConfig, $advancedText, [Text.UTF8Encoding]::new($false))
+    $advancedHash = (Get-FileHash -Algorithm SHA256 -LiteralPath $advancedConfig).Hash
+    $advancedEdit = Invoke-Tool -Arguments @('-Action', 'ConfigureProvider', '-ConfigPath', $advancedConfig, '-ProviderId', 'cst_advanced', '-ProviderName', 'Converted', '-BaseUrl', 'https://example.invalid/v1', '-EnvKey', 'CST_ADVANCED_KEY', '-SkipCodexValidation', '-NoPause')
+    Assert-True ($advancedEdit.ExitCode -ne 0 -and (Get-FileHash -Algorithm SHA256 -LiteralPath $advancedConfig).Hash -eq $advancedHash) 'Generic provider form cannot silently convert OpenAI-managed authentication'
+
     $rollbackBefore = (Get-FileHash -Algorithm SHA256 -LiteralPath $freshConfig).Hash
     $rollback = Invoke-Tool -ForceValidationFailure -Arguments @('-Action', 'SetContext', '-ConfigPath', $freshConfig, '-ContextWindow', '400000', '-AutoCompactLimit', '350000', '-NoPause')
     $rollbackAfter = (Get-FileHash -Algorithm SHA256 -LiteralPath $freshConfig).Hash
@@ -225,12 +265,15 @@ try {
 
     $restoreBaselineHash = (Get-FileHash -Algorithm SHA256 -LiteralPath $freshConfig).Hash
     $changeForRestore = Invoke-Tool -Arguments @('-Action', 'SetContext', '-ConfigPath', $freshConfig, '-ContextWindow', '300000', '-AutoCompactLimit', '250000', '-SkipCodexValidation', '-NoPause')
-    . $tool -ConfigPath $freshConfig -SkipCodexValidation -NoPause
-    $latestBackup = @(Get-BackupRecords | Select-Object -First 1)
-    $restoreSucceeded = $true
-    try { Restore-BackupRecord -Record $latestBackup[0] } catch { $restoreSucceeded = $false }
+    $backupList = Invoke-Tool -Arguments @('-Action', 'ListBackups', '-ConfigPath', $freshConfig, '-Json', '-SkipCodexValidation', '-NoPause')
+    $backupRecords = [object[]]($backupList.Output | ConvertFrom-Json)
+    $latestBackupName = $backupRecords[0].Name
+    $changedHash = (Get-FileHash -Algorithm SHA256 -LiteralPath $freshConfig).Hash
+    $restoreDenied = Invoke-Tool -Arguments @('-Action', 'RestoreBackup', '-ConfigPath', $freshConfig, '-BackupName', $latestBackupName, '-SkipCodexValidation', '-NoPause')
+    Assert-True ($restoreDenied.ExitCode -ne 0 -and (Get-FileHash -Algorithm SHA256 -LiteralPath $freshConfig).Hash -eq $changedHash) 'RestoreBackup refuses to overwrite config without explicit confirmation switch'
+    $restoreAction = Invoke-Tool -Arguments @('-Action', 'RestoreBackup', '-ConfigPath', $freshConfig, '-BackupName', $latestBackupName, '-ConfirmRestoreBackup', '-SkipCodexValidation', '-NoPause')
     $restoredHash = (Get-FileHash -Algorithm SHA256 -LiteralPath $freshConfig).Hash
-    Assert-True ($changeForRestore.ExitCode -eq 0 -and $restoreSucceeded -and $restoredHash -eq $restoreBaselineHash) 'Backup restore returns the exact pre-change config and creates a safety backup'
+    Assert-True ($changeForRestore.ExitCode -eq 0 -and $backupList.ExitCode -eq 0 -and $restoreAction.ExitCode -eq 0 -and $restoredHash -eq $restoreBaselineHash) 'Public backup list/restore actions return the exact pre-change config and create a safety backup'
 
     $legacyHome = Join-Path $testRoot 'legacy-secret-fixture'
     New-Item -ItemType Directory -Path $legacyHome | Out-Null
@@ -294,6 +337,12 @@ try {
     }
     throw
 } finally {
+    foreach ($name in $script:UserEnvironmentCleanup) {
+        $environmentKey = [Microsoft.Win32.Registry]::CurrentUser.OpenSubKey('Environment', $true)
+        try { if ($null -ne $environmentKey) { $environmentKey.DeleteValue($name, $false) } }
+        finally { if ($null -ne $environmentKey) { $environmentKey.Dispose() } }
+        [Environment]::SetEnvironmentVariable($name, $null, 'Process')
+    }
     if ($KeepTemp) {
         Write-Host ('Kept test directory: ' + $testRoot)
     } else {
