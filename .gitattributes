@@ -1,0 +1,4 @@
+# The committed GUI fingerprints these two sources. Keep checkout bytes stable
+# even when Windows Git is configured with core.autocrlf=true.
+Codex-Switch-Tools.ps1 text eol=lf
+src/CodexSwitchTools.Gui.cs text eol=lf
