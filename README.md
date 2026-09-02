@@ -6,14 +6,16 @@
 
 一个面向 Codex CLI、Codex 桌面端和 IDE 扩展的中文配置工具，用来管理用户级 Provider、请求模型、上下文窗口、API Key、配置备份和诊断。
 
-推荐使用 [`dist/CodexSwitchTools.exe`](dist/CodexSwitchTools.exe)。它是原生 Windows Forms 单文件程序，不需要管理员权限；BAT/PowerShell 入口保留给自动化和故障恢复。
+**[下载最新版中文 EXE](https://github.com/phxumy/codex-switch-tools/releases/latest/download/CodexSwitchTools.exe)** · [发行版与更新说明](https://github.com/phxumy/codex-switch-tools/releases/latest) · [SHA-256 校验文件](https://github.com/phxumy/codex-switch-tools/releases/latest/download/SHA256SUMS.txt)
+
+下载后直接双击即可，不需要克隆仓库、安装 Python、安装 PowerShell 7 或以管理员身份运行。它是原生 Windows Forms 单文件程序，使用 Windows 自带的 .NET Framework 4.x 和 Windows PowerShell 5.1；BAT/PowerShell 入口保留给自动化和故障恢复。
 
 > [!IMPORTANT]
 > 这个工具修改的是“下次启动预计使用的持久配置”，不是模型服务器。它不能证明服务端最终用了哪个模型，也不会替你判断第三方 Provider 是否可信。执行真实探测前，务必先核对 Base URL。
 
 ## 下载、安装与第一次启动
 
-1. 下载 [`dist/CodexSwitchTools.exe`](dist/CodexSwitchTools.exe) 和 [`SHA256SUMS.txt`](SHA256SUMS.txt)。
+1. 打开[最新发行版](https://github.com/phxumy/codex-switch-tools/releases/latest)，在 **Assets** 中下载 `CodexSwitchTools.exe` 和同一版本的 `SHA256SUMS.txt`。不要把自动生成的 `Source code (zip)` 当成安装包；普通用户只需要 EXE。
 2. 把 EXE 放到一个不会随便移动的固定目录，例如 `D:\Tools\CodexSwitchTools\`。
 3. 可选：用 PowerShell 核对文件哈希：
 
@@ -21,12 +23,14 @@
    Get-FileHash -Algorithm SHA256 .\CodexSwitchTools.exe
    ```
 
-   输出应与 `SHA256SUMS.txt` 中的值一致。
-4. 双击 EXE。程序无商业代码签名，Windows SmartScreen 可能显示“未知发布者”。
+   输出应与同一发行版 `SHA256SUMS.txt` 中 EXE 的值一致。哈希不一致时不要运行，重新从本仓库的发行版下载。
+4. 双击 EXE。程序没有代码签名，Windows SmartScreen 可能显示“未知发布者”；先核对下载网址、版本和哈希，再自行决定是否信任。不要关闭系统安全防护，不要运行来源不明的同名 EXE；单位电脑受管理策略限制时联系管理员。
 5. 先在“状态总览”核对配置路径。默认是 `%USERPROFILE%\.codex\config.toml`；如果设置了 `CODEX_HOME`，则是 `%CODEX_HOME%\config.toml`。
 6. 进入“密钥、备份与诊断”，点击“创建中文桌面快捷方式”。快捷方式会指向当前 EXE，因此创建后不要再移动 EXE。
 
 v1.1.1 起，EXE、窗口标题栏、Alt+Tab、桌面快捷方式和任务栏都使用项目自己的蓝橙切换图标。
+
+升级时先退出旧工具，用新 EXE 替换固定目录中的旧文件，再启动即可。用户配置和备份不存放在 EXE 内，不会因替换 EXE 被清空。发行版目标是 Windows 10/11 x64；自动测试运行在 GitHub Windows runner，未逐一验证所有 Windows 10/11 版本或企业加固环境，详见“兼容性与测试”。
 
 ## 先弄清三个概念
 
@@ -36,7 +40,7 @@ v1.1.1 起，EXE、窗口标题栏、Alt+Tab、桌面快捷方式和任务栏都
 | 模型 ID | 发给 Provider 的模型名称字符串 | 能写入，不能证明服务端没有重映射 |
 | 上下文窗口 | `model_context_window` 和自动压缩阈值 | 能写入，不能证明目标模型真的支持该数值 |
 
-三者相互独立。尤其要记住：**切换 Provider 不会自动清除原来的上下文覆盖**；切换后必须重新确认新 Provider 是否支持当前值。
+三者相互独立。v1.2.0 的 GUI 会同时管理所选第三方 Provider 的模型目录与适用上下文，避免把官方 DeepSeek 的窗口直接带到物理所等其他服务；命令行不带 `-ManageModelCatalog` 的传统切换仍保留原上下文。无论哪种方式，工具记录的能力都不等于服务端实际支持保证。
 
 ## 一分钟快速上手
 
@@ -81,13 +85,37 @@ v1.1.1 起，EXE、窗口标题栏、Alt+Tab、桌面快捷方式和任务栏都
 #### 切换已有第三方 Provider
 
 1. 在 `Provider` 下拉框选择目标 Provider。
-2. 填写服务商文档给出的真实“模型 ID”。第三方 Provider 必填。
-3. `推理强度` 不确定时选“模型默认”。选择具体值只是在配置里写请求偏好，服务商未必支持每一级。
-4. 点击“应用选择”。
-5. 如果弹出上下文或 Key 警告，先核对再确认。
-6. 成功后完全退出并重启 Codex/VS Code。
+2. 从模型下拉框选择模型。工具会读取已保存的列表和内置的已知模型元数据，并记住该 Provider 上次选择。
+3. 想获取服务商新模型时，先确认 Base URL，再点击“刷新模型列表”。它只在你点击后发送 `GET <Base URL>/models`；不会自动发送聊天或图片，也不会自动切换当前模型。
+4. `推理强度` 不确定时选“模型默认”。已知模型只提供其元数据声明的档位；未知模型不自动套用其他模型的推理强度。
+5. 点击“应用选择”。程序会生成该 Provider 独立的模型目录，写入 `model_catalog_json`、Provider 和模型配置；已有非本工具管理的目录需要明确确认才能替换。
+6. 如果弹出未知能力、上下文或 Key 警告，先核对再确认。
+7. 成功后**完全退出并重启 Codex/VS Code**。Codex 在启动时加载模型目录，不会因工具保存配置立刻热更新菜单。
 
-工具会保留已有上下文覆盖。如果旧 Provider 用了 872K、新 Provider 只支持更小窗口，请随后去“上下文窗口”恢复默认或改成服务商明确支持的值。
+Codex 的模型菜单应使用当前 Provider 的目录，但部分桌面版本仍可能把第三方模型显示为“自定义 / Custom”。以本工具状态页中的 Provider、模型 ID 和目录为准；**DeepSeek Provider 下不要点击 GPT / 5.6 等 OpenAI 模型**。本工具能阻止自己界面里的明显错配，不能拦截 Codex 原生界面之后重新写入模型的操作。若原生菜单仍旧，先重启并检查是否有任务或 profile 覆盖，不要靠点击不相干的模型“刷新”。
+
+#### 新模型、视觉模型与自动发现
+
+不需要把模型永远固定成 `deepseek-v4-pro`，也不需要每次先手工找名称。常规流程是“选 Provider → 刷新模型列表 → 选模型 → 应用 → 重启”。
+
+`GET /models` 通常只提供模型 ID 等基本信息，**不保证包含上下文长度、图片输入或推理档位**。工具按“Provider 端点 + 模型 ID”匹配元数据，不能仅凭名字含有 `vision` 就宣称支持图片。
+
+| 服务与模型 | v1.2.0 随附的已知能力 | 使用边界 |
+|---|---|---|
+| 官方 DeepSeek `deepseek-v4-pro`、`deepseek-v4-flash` | 1,048,576 tokens，文本输入 | 仅匹配官方 DeepSeek API 端点；不自动等同于同名第三方模型 |
+| 官方 DeepSeek `deepseek-v4-flash-vision-exp` | 1,048,576 tokens，文本与图片输入 | 实验视觉模型；须同时使用支持图片输入的 Responses 接口 |
+| 物理所 IPHY `deepseek-v4-pro` | 已知配置为 262,144 tokens，文本输入 | 与官方 DeepSeek 分开管理；不假设物理所开放全部官方模型 |
+| 其他或新发布的模型 | 标为元数据未验证，保守回退为文本、32,768 tokens | 不是服务商容量声明，应用前需要确认；真实限制可能更低 |
+
+物理所或其他服务是否开放某个新模型，以其实际 `/models` 返回和服务说明为准。离线内置项只表示工具知道这个模型的配置，不能证明当前账户有权限。
+
+如果 `/models` 不受支持、网络失败，或服务商提供了尚未列出的模型，可以勾选“高级：手动输入模型 ID（通常不需要）”后输入准确 ID。只有确认服务商能力后才应用未知模型，并按文档设置自定义上下文；不要为了去掉警告随意放大窗口。未知模型不会自动启用图片能力。
+
+刷新需要把当前 Provider 的 Bearer Key 发给它的 Base URL，因此只使用可信 HTTPS 端点；本机 HTTP 测试服务例外。高级 command auth、额外 headers/query 等认证定义不由通用刷新动作执行。Key 缺失、认证失败或刷新失败时，先修正连接，已有列表和选择不应被误当成刷新成功。
+
+依据：[DeepSeek Codex 配置](https://api-docs.deepseek.com/quick_start/agent_integrations/codex/)、[模型列表接口](https://api-docs.deepseek.com/api/list-models/)、[Codex 配置参考](https://developers.openai.com/codex/config-reference/)。模型清单会变化，以刷新结果和服务商最新说明为准。
+
+模型目录是兼容层，不只是名称清单。已验证的 Codex 版本要求目录提供基础指令；本工具生成一段简短、中性的编程助手指令，不复制旧版的大段 GPT 提示词或用户私人提示词。因此第三方模型的基础行为不保证与 Codex 内置模型完全相同。
 
 #### 恢复内置 OpenAI
 
@@ -95,7 +123,8 @@ v1.1.1 起，EXE、窗口标题栏、Alt+Tab、桌面快捷方式和任务栏都
 
 - 写入 `model_provider = "openai"`；
 - 删除根级自定义 `model` 和 `model_reasoning_effort` 覆盖；
-- 保留登录方式、上下文覆盖、自定义 Provider 定义、`model_catalog_json` 和 Windows 环境变量。
+- 对本工具管理的模型目录及相关上下文，恢复到首次接管前的状态：原来没有自定义目录时恢复 Codex 内置目录，原来有目录时恢复原路径；
+- 不擅自删除未被本工具接管的目录或上下文；保留登录方式、自定义 Provider 定义和 Windows 环境变量。
 
 它不是“恢复出厂设置”，也不会替你登录或删除第三方 API Key。
 
@@ -108,7 +137,7 @@ v1.1.1 起，EXE、窗口标题栏、Alt+Tab、桌面快捷方式和任务栏都
 5. 只有目标端点确实无需 Bearer Key 时，才勾选“此 Provider 不需要 Bearer Key”。
 6. 点击“保存 Provider 定义”。此时只保存定义，**不会保存 Key，也不会设为当前 Provider**。
 7. 去“密钥、备份与诊断”保存 Key。
-8. 回到本页上半部分，选择刚保存的 Provider，填写模型 ID，点击“应用选择”。
+8. 回到本页上半部分，选择刚保存的 Provider，刷新并选择模型，点击“应用选择”。接口不支持模型列表时才使用高级手动输入。
 9. 重启 Codex。
 
 “从选中项填入”只会把简单 Provider 填入表单，不写配置。使用 command auth、headers、query、OpenAI 登录或旧内联 token 的高级 Provider 会保持只读，防止通用表单破坏其认证语义。
@@ -118,6 +147,7 @@ v1.1.1 起，EXE、窗口标题栏、Alt+Tab、桌面快捷方式和任务栏都
 ```toml
 model = "provider-model-id"
 model_provider = "cst_my_provider"
+# GUI 应用模型时还会写入本机生成的独立 model_catalog_json 路径。
 
 [model_providers.cst_my_provider]
 name = "My Provider"
@@ -250,15 +280,15 @@ Windows User 环境变量存放在当前用户配置中，不是加密保险箱�
 
 1. 保存 Provider 定义。
 2. 保存与其 `env_key` 同名的 User API Key。
-3. 选择 Provider，填写服务商给出的模型 ID，应用选择。
-4. 检查旧上下文覆盖是否仍适合新服务。
+3. 选择 Provider，刷新模型列表，选择目标模型，应用选择。
+4. 检查生成的目录和上下文；未知模型先核实服务商限制。
 5. 可选：先做离线校验；只有确认 Base URL 和费用后才做真实探测。
 6. 完全退出并重启 Codex。
 
 ### 从第三方 Provider 回到内置 OpenAI
 
 1. 点击“恢复内置 OpenAI”。
-2. 去“上下文窗口”确认第三方使用的覆盖是否需要恢复默认。
+2. 检查状态页，确认工具管理的目录和上下文已恢复到接管前状态；此前的手动覆盖仍需自行核实。
 3. 重启 Codex，并确认原有 OpenAI 登录仍有效。
 4. 自定义 Provider 和 User Key 会保留；若确实不再需要 Key，可另行删除 User Key。
 
@@ -303,6 +333,7 @@ Codex 官方配置说明：
 |---|---|---:|---:|
 | Codex 用户配置 | `%USERPROFILE%\.codex\config.toml` | 否 | 是，整文件 |
 | 工具配置备份 | `.codex\switch-tools\backups` | 否 | 不适用 |
+| Provider 模型目录与发现缓存 | `.codex\switch-tools` 下，按 Provider 分开保存 | 否，不保存 API Key | 不是整文件配置备份的一部分 |
 | User API Key | Windows User 环境变量 | 否 | 否 |
 | GUI 临时内嵌核心 | `%LOCALAPPDATA%\CodexSwitchTools\Runtime` | 否，限制当前用户与 SYSTEM | 否，退出时尽力清理 |
 | 桌面快捷方式 | Windows 桌面 | 否 | 否 |
@@ -319,6 +350,21 @@ Codex 官方配置说明：
 2. 重新打开工具并刷新状态，确认持久配置已经写入。
 3. 检查是否有 CLI 参数、profile、可信项目配置或 UI 选择覆盖。
 4. Key 刚写入时，必要时注销 Windows，让新进程继承 User 环境变量。
+
+### DeepSeek 下仍显示“自定义”，或出现 OpenAI 模型菜单
+
+1. 确认运行的是 v1.2.0 或更新版，并在工具里重新选 Provider、模型，再“应用选择”。
+2. 检查状态中的模型目录已由本工具管理，然后完全退出并重启 Codex。
+3. 部分 Codex 桌面版本可能仍显示“自定义”；这不是对实际后端身份的判断。不要在 DeepSeek 下选择原生菜单中的 GPT 模型。
+4. 检查 profile、已有任务和 UI 保存的模型是否覆盖用户配置；必要时用一个短的新任务验证。
+5. 工具只能控制自己写入的配置，不能保证每个 Codex 版本的原生菜单呈现完全相同。
+
+### 刷新后没有新模型，或视觉模型不能收图片
+
+- `/models` 返回的是这个端点和账户可见的模型，不是所有服务商的公共模型合集；物理所未部署的模型不会因为官方发布就自动可用。
+- 未提供 `/models` 的服务需要使用高级手动模型；401/403 则先检查 Key、权限和 Base URL。
+- 模型 ID 本身不能证明图片能力；未知模型不会自动标成视觉模型。官方已验证视觉模型之外，需先确认服务端和 Codex 接口均支持图片。
+- 刷新列表不会自动改动已选模型，确认后还需要“应用选择”和重启。
 
 ### Key 显示存在但请求仍 401
 
@@ -365,24 +411,32 @@ Windows 可能缓存 EXE 和固定项图标：
 ```powershell
 .\Codex-Switch-Tools.ps1 -Action Status -Json
 .\Codex-Switch-Tools.ps1 -Action ConfigureProvider -ProviderId cst_demo -ProviderName Demo -BaseUrl https://example.com/v1 -EnvKey CODEX_DEMO_API_KEY
-.\Codex-Switch-Tools.ps1 -Action SetProvider -ProviderId cst_demo -Model provider-model-id
+.\Codex-Switch-Tools.ps1 -Action ListModels -ProviderId deepseek -Json
+.\Codex-Switch-Tools.ps1 -Action RefreshModels -ProviderId deepseek -Json
+.\Codex-Switch-Tools.ps1 -Action SetProvider -ProviderId deepseek -Model deepseek-v4-pro -ManageModelCatalog
 .\Codex-Switch-Tools.ps1 -Action SetContext -ContextWindow 872000 -AutoCompactLimit 800000
 .\Codex-Switch-Tools.ps1 -Action ResetContext
 .\Codex-Switch-Tools.ps1 -Action UseOpenAI
 .\Codex-Switch-Tools.ps1 -Action ListBackups -Json
 ```
 
+`ListModels` 不联网；`RefreshModels` 会向所选 Provider 发出模型列表请求。`SetProvider -ManageModelCatalog` 启用与 GUI 相同的独立目录管理；没有此标志的脚本调用保留原行为。未知模型需要显式 `-AllowUnverifiedModel`；接管已有非本工具目录需要显式 `-ReplaceExistingCatalog`，不要在不核实的情况下批量添加这两个确认标志。
+
 不要通过命令行参数传 API Key。核心的 `SetApiKey` 动作只接受标准输入。BAT 会从 PATH 选择 PowerShell，文本菜单创建同名桌面快捷方式时可能直接覆盖；日常使用更推荐 EXE。
 
 ## 兼容性与测试
 
-支持范围：64 位 Windows、.NET Framework 4.x、Windows PowerShell 5.1；安装 PowerShell 7 时会优先使用符合版本信息检查的标准安装。Windows Script Host 仅在创建快捷方式时需要。
+目标环境：Windows 10/11 x64、.NET Framework 4.x、Windows PowerShell 5.1。不需要额外安装 PowerShell 7；已安装时会优先使用符合版本信息检查的标准安装。Windows Script Host 仅在创建快捷方式时需要。CI 的 Windows runner 与本地隔离测试不能等同于所有 Windows 10/11、ARM64 或企业安全策略环境的认证；这些组合需以实际验证为准。
 
 核心隔离测试：
 
 ```powershell
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\tests\Run-Tests.ps1
 pwsh.exe -NoProfile -File .\tests\Run-Tests.ps1
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\tests\Test-ModelCatalog.ps1
+pwsh.exe -NoProfile -File .\tests\Test-ModelCatalog.ps1
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\tests\Test-CodexCatalogIntegration.ps1
+pwsh.exe -NoProfile -File .\tests\Test-CodexCatalogIntegration.ps1
 ```
 
 GUI 构建/自测：
@@ -405,6 +459,7 @@ $env:CST_RUN_CODEX_INTEGRATION = '1'
 - GUI/配置路径含空格、`&`、括号和中文；
 - UTF-8 BOM/无 BOM、CRLF/LF、注释、数组和多行字符串；
 - Provider → OpenAI → Provider；
+- 模型列表读取/刷新、本地 mock、按 Provider 分离目录、未知模型确认和目录/上下文恢复；
 - 上下文开启/恢复、手工值保护；
 - Key 标准输入、零回显和删除确认；
 - 备份列表/整文件恢复；
@@ -413,7 +468,7 @@ $env:CST_RUN_CODEX_INTEGRATION = '1'
 - 安全直接探测；
 - 仓库密钥和私人路径扫描。
 
-GitHub Actions 在 Windows 上运行 PowerShell 5.1、PowerShell 7 和 GUI 构建自测；真实、可能计费的 Provider 请求不会进入 CI。
+GitHub Actions 在 Windows 上运行 PowerShell 5.1、PowerShell 7 和 GUI 构建自测，并用固定版本 Codex CLI `0.150.1` 验证生成目录确实能被 `app-server` 的 `model/list` 读取。集成测试只发送初始化和模型列表 RPC，使用临时配置、dummy Key 和 loopback 路由，不创建任务或发送推理请求。本机没有 Codex 时可选集成测试会明确跳过；CI 则必须安装并通过指定版本。另已本机验证 Codex `0.152.1` 的同一目录读取行为。真实 Provider Key 和可能计费的请求不会进入 CI。tag 发行流程先通过这些检查，再从该 tag 源码构建 EXE、生成校验文件并上传到 GitHub Releases。
 
 ## 从源码构建中文 EXE
 
@@ -441,9 +496,20 @@ powershell.exe -ExecutionPolicy Bypass -File .\build-gui.ps1
 - `Codex-Switch-Tools.bat`：文本菜单入口；
 - `Codex-Switch-Tools.ps1`：唯一配置、备份和探测核心；
 - `tests/Run-Tests.ps1`：核心回归测试；
+- `tests/Test-ModelCatalog.ps1`：模型发现、目录隔离与恢复回归测试；
+- `tests/Test-CodexCatalogIntegration.ps1`：可选 Codex 原生目录/图片能力读取验证，无推理请求；
 - `tests/Test-GuiSmoke.ps1`：GUI 构建、隐藏窗口和图标自测；
 - `tests/Test-LocalProviderRoute.ps1`：本地 mock 路由测试；
 - `tests/Test-RepositoryHygiene.ps1`：仓库敏感信息扫描。
+
+## 维护者发布发行版
+
+1. 更新 `VERSION`、`CHANGELOG.md` 和对应 `releases/v<版本>.md`，完成本地测试。
+2. 提交并推送代码，再为同一提交创建并推送对应 `v<版本>` tag；tag 必须与 `VERSION` 一致。
+3. `Windows executable release` 工作流先调用兼容性测试，再重新构建 EXE，上传 `CodexSwitchTools.exe` 与 `SHA256SUMS.txt`。只有发布 job 获得仓库内容写权限，测试 job 只读。
+4. 检查工作流结果、发行版 Assets 和下载后哈希，再向用户提供下载链接。源码 ZIP 不代替可执行文件附件。
+
+发布后的 EXE 和哈希按版本保留；重跑已发布版本不会静默覆盖附件，修复应发布新版本。工作流使用 GitHub 提供的临时 `GITHUB_TOKEN`，不需要把个人 token 或任何 Provider API Key 写进仓库。
 
 ## 免责声明
 

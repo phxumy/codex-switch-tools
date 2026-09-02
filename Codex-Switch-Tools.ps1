@@ -1,6 +1,6 @@
 ﻿[CmdletBinding()]
 param(
-    [ValidateSet('Menu', 'Status', 'UseOpenAI', 'ConfigureProvider', 'SetProvider', 'SetContext', 'ResetContext', 'ToggleLongContext', 'MigrateLegacySecret', 'SetApiKey', 'RemoveApiKey', 'ListBackups', 'RestoreBackup', 'DirectProbe', 'Validate')]
+    [ValidateSet('Menu', 'Status', 'UseOpenAI', 'ConfigureProvider', 'SetProvider', 'ListModels', 'RefreshModels', 'SetContext', 'ResetContext', 'ToggleLongContext', 'MigrateLegacySecret', 'SetApiKey', 'RemoveApiKey', 'ListBackups', 'RestoreBackup', 'DirectProbe', 'Validate')]
     [string]$Action = 'Menu',
     [string]$ConfigPath,
     [string]$ProviderId,
@@ -22,6 +22,10 @@ param(
     [switch]$ForceRemoveApiKey,
     [switch]$ConfirmDirectProbe,
     [switch]$ConfirmRestoreBackup,
+    [switch]$ConfirmModelRefresh,
+    [switch]$ManageModelCatalog,
+    [switch]$AllowUnverifiedModel,
+    [switch]$ReplaceExistingCatalog,
     [switch]$NoPause,
     [switch]$SkipCodexValidation,
     [switch]$Json
@@ -31,7 +35,7 @@ Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 try { [Console]::OutputEncoding = [Text.UTF8Encoding]::new($false) } catch { }
 
-$script:ToolVersion = '1.1.1'
+$script:ToolVersion = '1.2.0'
 $script:EntryExitCode = 0
 $script:ContextMarkerPattern = '^\s*#\s*CST_CONTEXT_V1\s+previous_window=(absent|[0-9_]+)\s+previous_compact=(absent|[0-9_]+)\s*$'
 $script:ReservedProviderIds = @('openai', 'ollama', 'lmstudio')
@@ -439,7 +443,7 @@ function Assert-BaseUrl {
     if (-not [string]::IsNullOrWhiteSpace($uri.UserInfo) -or -not [string]::IsNullOrWhiteSpace($uri.Query) -or -not [string]::IsNullOrWhiteSpace($uri.Fragment)) {
         throw 'Base URL cannot contain credentials, query parameters or a fragment. Configure those separately in Codex.'
     }
-    if ($uri.Scheme -eq 'http' -and $uri.Host -notin @('127.0.0.1', 'localhost', '::1')) {
+    if ($uri.Scheme -eq 'http' -and -not $uri.IsLoopback) {
         Write-Warning 'This provider uses unencrypted HTTP. Use HTTPS unless this is a trusted local endpoint.'
     }
 }
@@ -954,6 +958,296 @@ function Reset-ManagedContext {
     }
 }
 
+function Get-ModelProviderKind {
+    param($Definition)
+    $uri = $null
+    if ($null -eq $Definition -or -not [Uri]::TryCreate($Definition.BaseUrl, [UriKind]::Absolute, [ref]$uri)) { return 'generic' }
+    if ($uri.Scheme -ne 'https' -or -not $uri.IsDefaultPort -or $uri.UserInfo -or $uri.Query -or $uri.Fragment) { return 'generic' }
+    $path = $uri.AbsolutePath.TrimEnd('/')
+    if ($uri.Host -ieq 'api.deepseek.com' -and $path -in @('', '/v1')) { return 'deepseek' }
+    if ($uri.Host -ieq 'chat.iphy.ac.cn' -and $path -eq '/api/v1') { return 'iphy' }
+    return 'generic'
+}
+
+function Get-ProviderModelStatePath {
+    param($Definition)
+    Assert-ProviderId -Id $Definition.Id
+    Assert-BaseUrl -Url $Definition.BaseUrl 3>$null
+    $endpoint = ([Uri]$Definition.BaseUrl).AbsoluteUri.TrimEnd('/')
+    $hash = Get-Sha256Hex -Bytes ([Text.Encoding]::UTF8.GetBytes($endpoint))
+    return Join-Path (Join-Path $script:ToolDataDir 'models') ($Definition.Id.ToLowerInvariant() + '-' + $hash.Substring(0, 16) + '.json')
+}
+
+function Read-ProviderModelState {
+    param($Definition)
+    $empty = [pscustomobject]@{ Version = 1; LastModel = $null; RefreshedAt = $null; DiscoveredIds = $null; ManualIds = @(); LastContextWindow = $null }
+    $path = Get-ProviderModelStatePath -Definition $Definition
+    if (-not (Test-Path -LiteralPath $path -PathType Leaf)) { return $empty }
+    try {
+        if ((Get-Item -LiteralPath $path).Length -gt 1048576) { throw 'Cache too large.' }
+        $state = [IO.File]::ReadAllText($path) | ConvertFrom-Json
+        foreach ($name in @('Version', 'LastModel', 'RefreshedAt', 'DiscoveredIds', 'ManualIds', 'LastContextWindow')) {
+            if ($null -eq $state.PSObject.Properties[$name]) { throw 'Incomplete cache.' }
+        }
+        if ($state.Version -ne 1) { throw 'Unsupported cache.' }
+        if (($null -ne $state.DiscoveredIds -and $state.DiscoveredIds -isnot [Array]) -or $state.ManualIds -isnot [Array]) { throw 'Invalid cached list.' }
+        if ($null -ne $state.LastModel) { Assert-ModelId -ModelId $state.LastModel }
+        if ($null -ne $state.LastContextWindow -and ([long]$state.LastContextWindow -lt 1024 -or [long]$state.LastContextWindow -gt 10000000)) { throw 'Invalid cached context.' }
+        foreach ($id in @($state.DiscoveredIds) + @($state.ManualIds)) {
+            if ($null -ne $id) { Assert-ModelId -ModelId $id }
+        }
+        if (@($state.DiscoveredIds).Count -gt 500 -or @($state.ManualIds).Count -gt 500) { throw 'Too many cached models.' }
+        return $state
+    } catch { return $empty }
+}
+
+function Save-ProviderModelState {
+    param($Definition, $State)
+    $path = Get-ProviderModelStatePath -Definition $Definition
+    $directory = Split-Path -Parent $path
+    if (-not (Test-Path -LiteralPath $directory -PathType Container)) { New-Item -ItemType Directory -Path $directory -Force | Out-Null }
+    $temporary = Join-Path $directory ('.models-' + [guid]::NewGuid().ToString('N') + '.tmp')
+    try {
+        [IO.File]::WriteAllText($temporary, ($State | ConvertTo-Json -Depth 6), [Text.UTF8Encoding]::new($false))
+        if (Test-Path -LiteralPath $path -PathType Leaf) { [IO.File]::Replace($temporary, $path, $null) }
+        else { [IO.File]::Move($temporary, $path) }
+    } finally { if (Test-Path -LiteralPath $temporary -PathType Leaf) { [IO.File]::Delete($temporary) } }
+}
+
+function New-ModelMetadata {
+    param([string]$Id, [string]$Kind)
+    $official = $Kind -eq 'deepseek' -and $Id -cin @('deepseek-v4-flash', 'deepseek-v4-pro', 'deepseek-v4-flash-vision-exp')
+    $iphyPreset = $Kind -eq 'iphy' -and $Id -ceq 'deepseek-v4-pro'
+    $known = $official -or $iphyPreset
+    $levels = @()
+    if ($known) { $levels = @('low', 'high', 'max') }
+    return [pscustomobject]@{
+        Id = $Id
+        DisplayName = if ($official) { $Id.Replace('deepseek-', 'DeepSeek-') } elseif ($iphyPreset) { 'IPHY DeepSeek-V4-Pro' } else { $Id }
+        Verified = $known
+        SupportsImages = $official -and $Id -ceq 'deepseek-v4-flash-vision-exp'
+        SupportsSearch = $official
+        ContextWindow = if ($official) { 1048576L } elseif ($iphyPreset) { 262144L } else { 32768L }
+        ReasoningLevels = $levels
+        Source = if ($official) { 'DeepSeek official Codex metadata (2026-09-02); not a live access check' } elseif ($iphyPreset) { 'IPHY legacy 256K preset; verify your deployment' } else { 'Unverified metadata: conservative text-only / 32K fallback' }
+    }
+}
+
+function Get-ProviderModels {
+    param([string]$Id)
+    $document = Read-ConfigDocument
+    if ($Id -eq 'openai') {
+        $models = @()
+        $nativePath = Join-Path $script:CodexDir 'models_cache.json'
+        if (Test-Path -LiteralPath $nativePath -PathType Leaf) {
+            try {
+                $native = [IO.File]::ReadAllText($nativePath) | ConvertFrom-Json
+                $models = @($native.models | Where-Object { $_.visibility -eq 'list' } | ForEach-Object {
+                    [pscustomobject]@{ Id = $_.slug; DisplayName = $_.display_name; Verified = $true; SupportsImages = 'image' -in $_.input_modalities; ContextWindow = $_.context_window; ReasoningLevels = @($_.supported_reasoning_levels | ForEach-Object { $_.effort }); Source = 'Local Codex native cache' }
+                })
+            } catch { $models = @() }
+        }
+        return [pscustomobject]@{ ProviderId = $Id; LastModel = $null; RefreshedAt = $null; Models = $models; Warnings = @() }
+    }
+    $definition = Get-ProviderDefinition -Document $document -Id $Id
+    if ($null -eq $definition) { throw "Provider '$Id' is not configured." }
+    $kind = Get-ModelProviderKind -Definition $definition
+    $state = Read-ProviderModelState -Definition $definition
+    $ids = [System.Collections.Generic.List[string]]::new()
+    if ($null -ne $state.DiscoveredIds) { foreach ($modelId in @($state.DiscoveredIds)) { if (-not $ids.Contains($modelId)) { $ids.Add($modelId) } } }
+    elseif ($kind -eq 'deepseek') { foreach ($modelId in @('deepseek-v4-flash', 'deepseek-v4-pro', 'deepseek-v4-flash-vision-exp')) { $ids.Add($modelId) } }
+    elseif ($kind -eq 'iphy') { $ids.Add('deepseek-v4-pro') }
+    foreach ($modelId in @($state.ManualIds)) { if ($modelId -and -not $ids.Contains($modelId)) { $ids.Add($modelId) } }
+    $items = @($ids | ForEach-Object { New-ModelMetadata -Id $_ -Kind $kind })
+    foreach ($item in $items) {
+        if ($item.Id -ceq $state.LastModel -and $null -ne $state.LastContextWindow) { $item.ContextWindow = [long]$state.LastContextWindow }
+    }
+    $warnings = @()
+    if ($kind -eq 'iphy') { $warnings += 'IPHY is a separate deployment: official DeepSeek model availability/vision support is not assumed.' }
+    if ($null -eq $state.RefreshedAt) { $warnings += 'Offline presets only. Refresh /models to discover models exposed to your key; discovery does not prove Responses/tool compatibility.' }
+    if (@($items | Where-Object { -not $_.Verified }).Count -gt 0) { $warnings += 'New model IDs do not reveal context, reasoning or image capabilities; unverified models require confirmation.' }
+    return [pscustomobject]@{ ProviderId = $Id; LastModel = $state.LastModel; RefreshedAt = $state.RefreshedAt; Models = $items; Warnings = $warnings }
+}
+
+function Invoke-RefreshModels {
+    param([string]$Id)
+    if (-not $ConfirmModelRefresh) { throw 'RefreshModels requires -ConfirmModelRefresh after checking the target Base URL.' }
+    $document = Read-ConfigDocument
+    $definition = Get-ProviderDefinition -Document $document -Id $Id
+    if ($null -eq $definition) { throw 'Custom provider was not found.' }
+    Assert-BaseUrl -Url $definition.BaseUrl
+    if ($definition.HasCommandAuth -or $definition.HasAdvancedRequestConfig -or $definition.HasInlineSecret -or $definition.RequiresOpenAIAuth -eq 'true') { throw 'Model discovery only supports simple env_key/no-auth providers. Advanced authentication is left untouched.' }
+    $uri = [Uri]($definition.BaseUrl.TrimEnd('/') + '/models')
+    if ($uri.Scheme -ne 'https' -and -not $uri.IsLoopback) { throw 'Model discovery requires HTTPS except on loopback.' }
+    $key = $null
+    if ($definition.EnvKey) {
+        $envStatus = Get-EnvironmentStatus -Name $definition.EnvKey
+        if ($envStatus.ProcessUserConflict) { throw 'The Process and User API keys differ. Restart the launcher before model discovery.' }
+        foreach ($scope in @('Process', 'User', 'Machine')) {
+            $key = [Environment]::GetEnvironmentVariable($definition.EnvKey, $scope)
+            if (-not [string]::IsNullOrWhiteSpace($key)) { break }
+        }
+        if ([string]::IsNullOrWhiteSpace($key)) { throw 'Provider API-key environment variable is missing.' }
+    }
+    Add-Type -AssemblyName System.Net.Http
+    $handler = [Net.Http.HttpClientHandler]::new()
+    $handler.AllowAutoRedirect = $false
+    $client = [Net.Http.HttpClient]::new($handler)
+    $client.Timeout = [TimeSpan]::FromSeconds(25)
+    $client.MaxResponseContentBufferSize = 1048576
+    $response = $null
+    try {
+        if ($key) { $client.DefaultRequestHeaders.Authorization = [Net.Http.Headers.AuthenticationHeaderValue]::new('Bearer', $key) }
+        $client.DefaultRequestHeaders.Accept.ParseAdd('application/json')
+        $response = $client.GetAsync($uri).GetAwaiter().GetResult()
+        if (-not $response.IsSuccessStatusCode) { throw ('Model discovery HTTP ' + [int]$response.StatusCode + '. No response body or credentials were logged; cached models were preserved.') }
+        $raw = $response.Content.ReadAsStringAsync().GetAwaiter().GetResult()
+        $body = $raw | ConvertFrom-Json
+        if ($null -eq $body.PSObject.Properties['data'] -or $body.data -isnot [Array]) { throw 'Invalid /models response: data must be an array.' }
+        if ($body.data.Count -lt 1 -or $body.data.Count -gt 500) { throw 'Invalid /models response: expected 1 to 500 model entries.' }
+        $ids = [System.Collections.Generic.List[string]]::new()
+        foreach ($entry in $body.data) {
+            if ($null -eq $entry -or $null -eq $entry.PSObject.Properties['id'] -or $entry.id -isnot [string]) { throw 'Invalid /models response: missing string id.' }
+            Assert-ModelId -ModelId $entry.id
+            if ($entry.id -cne $entry.id.Trim() -or $entry.id -match '\s') { throw 'Invalid /models response: model id contains whitespace.' }
+            # An endpoint must never make us persist a credential as a model name.
+            if (($key -and $entry.id.Contains($key)) -or $entry.id -match '(?i)^sk-|^Bearer\s') { throw 'Invalid /models response: secret-like model id.' }
+            if (-not $ids.Contains($entry.id)) { $ids.Add($entry.id) }
+        }
+        Assert-ConfigUnchangedSinceRead -Document $document
+        $state = Read-ProviderModelState -Definition $definition
+        $state.DiscoveredIds = @($ids)
+        $state.RefreshedAt = [DateTime]::UtcNow.ToString('o')
+        Save-ProviderModelState -Definition $definition -State $state
+    } catch {
+        $message = $_.Exception.Message
+        if ($message -notmatch '^(Model discovery HTTP|Invalid /models response)') { $message = 'Model discovery failed (network, timeout, TLS, oversized or invalid JSON response). Cached models were preserved.' }
+        throw $message
+    } finally {
+        $key = $null
+        if ($null -ne $response) { $response.Dispose() }
+        $client.Dispose()
+        $handler.Dispose()
+    }
+    return Get-ProviderModels -Id $Id
+}
+
+function Get-CatalogMarker {
+    param($Document)
+    foreach ($state in @(Get-TomlLineStates -Lines $Document.Lines)) {
+        if ($state.IsHeader) { break }
+        if ($state.NeutralAtStart -and $state.Text -match '^\s*# CST_CATALOG_V1 ([A-Za-z0-9+/=]+)\s*$') {
+            try {
+                $data = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($matches[1])) | ConvertFrom-Json
+                foreach ($key in @('PreviousCatalog', 'PreviousWindow', 'PreviousCompact', 'PreviousContextMarker', 'ManagedPath')) { if ($null -eq $data.PSObject.Properties[$key]) { throw 'Incomplete marker.' } }
+                foreach ($key in @('PreviousCatalog', 'PreviousWindow', 'PreviousCompact', 'PreviousContextMarker', 'ManagedPath')) {
+                    if ($null -ne $data.$key -and ($data.$key -isnot [string] -or $data.$key.Length -gt 8192 -or $data.$key -match '[\r\n]')) { throw 'Invalid marker value.' }
+                }
+                return [pscustomobject]@{ Index = $state.Index; Data = $data }
+            } catch { throw 'Model catalog recovery marker is invalid. Restore a backup before changing managed catalogs.' }
+        }
+    }
+    return $null
+}
+
+function Restore-ManagedCatalog {
+    param($Document)
+    $marker = Get-CatalogMarker -Document $Document
+    if ($null -eq $marker) { return }
+    if ((Get-RootValue -Document $Document -Key 'model_catalog_json') -cne $marker.Data.ManagedPath) { throw 'Model catalog path was changed outside this tool. Restore a backup or resolve the recovery marker before switching.' }
+    $Document.Lines.RemoveAt($marker.Index)
+    foreach ($pair in @(@('model_catalog_json', 'PreviousCatalog'), @('model_context_window', 'PreviousWindow'), @('model_auto_compact_token_limit', 'PreviousCompact'))) {
+        $value = $marker.Data.($pair[1])
+        if ($null -eq $value) { Remove-RootKey -Document $Document -Key $pair[0] }
+        else { Set-RootRawValue -Document $Document -Key $pair[0] -RawValue $value }
+    }
+    Remove-ContextMarkers -Document $Document
+    if ($null -ne $marker.Data.PreviousContextMarker) { $Document.Lines.Insert((Get-FirstTableIndex -Document $Document), $marker.Data.PreviousContextMarker) }
+}
+
+function New-CodexModelEntry {
+    param($Metadata)
+    $levels = @($Metadata.ReasoningLevels | ForEach-Object { [ordered]@{ effort = $_; description = ('Provider reasoning: ' + $_) } })
+    $modalities = @('text')
+    if ($Metadata.SupportsImages) { $modalities += 'image' }
+    return [ordered]@{
+        slug = $Metadata.Id; display_name = $Metadata.DisplayName; description = $Metadata.Source
+        default_reasoning_level = if ($levels.Count -gt 0) { 'high' } else { $null }
+        supported_reasoning_levels = $levels; shell_type = 'shell_command'; visibility = 'list'
+        minimal_client_version = '0.144.0'; supported_in_api = $true; priority = 1; upgrade = $null
+        base_instructions = 'You are a coding assistant collaborating with the user in a shared workspace. Follow the system and developer instructions. Use the available tools when appropriate. Preserve unrelated work, protect secrets, and validate changes before reporting completion.'
+        model_messages = $null; supports_reasoning_summaries = ($levels.Count -gt 0)
+        support_verbosity = $false; default_verbosity = $null; apply_patch_tool_type = 'freeform'
+        web_search_tool_type = 'text'; input_modalities = $modalities
+        supports_image_detail_original = [bool]$Metadata.SupportsImages
+        truncation_policy = [ordered]@{ mode = 'tokens'; limit = 10000 }
+        supports_parallel_tool_calls = $true; context_window = [long]$Metadata.ContextWindow
+        max_context_window = [long]$Metadata.ContextWindow; effective_context_window_percent = 95
+        auto_compact_token_limit = $null; prefer_websockets = $false; supports_search_tool = [bool]$Metadata.SupportsSearch
+        experimental_supported_tools = @()
+        tool_mode = $null; multi_agent_version = 'v2'; use_responses_lite = $false
+        include_skills_usage_instructions = $false; auto_review_model_override = $null
+        availability_nux = $null; default_service_tier = $null
+        default_reasoning_summary = 'none'; reasoning_summary_format = 'experimental'
+    }
+}
+
+function Enable-ProviderCatalog {
+    param($Document, $Definition, [string]$ModelId, [string]$Effort)
+    $kind = Get-ModelProviderKind -Definition $Definition
+    if ($kind -in @('deepseek', 'iphy') -and $ModelId -match '^(gpt-|codex-|o[134](?:-|$))') { throw 'DeepSeek provider cannot use an OpenAI model id. Select a DeepSeek model or restore OpenAI.' }
+    $list = Get-ProviderModels -Id $Definition.Id
+    $selected = @($list.Models | Where-Object { $_.Id -ceq $ModelId } | Select-Object -First 1)
+    $metadata = if ($selected.Count -eq 1) { $selected[0] } else { New-ModelMetadata -Id $ModelId -Kind $kind }
+    if (-not $metadata.Verified -and -not $AllowUnverifiedModel) { throw 'Model metadata is unverified. Use -AllowUnverifiedModel only after accepting text-only / conservative-context fallback.' }
+    if ($null -ne $ContextWindow) {
+        if ($ContextWindow -lt 1024 -or $ContextWindow -gt 10000000) { throw 'Model context must be between 1024 and 10000000 tokens.' }
+        $knownLimit = (New-ModelMetadata -Id $ModelId -Kind $kind).ContextWindow
+        if ($metadata.Verified -and $ContextWindow -gt $knownLimit) { throw 'Requested context exceeds the verified provider preset.' }
+        $metadata.ContextWindow = [long]$ContextWindow
+    }
+    if ($Effort -and @($metadata.ReasoningLevels) -cnotcontains $Effort.ToLowerInvariant()) { throw 'This model does not advertise the requested reasoning effort. Use model default or an advertised level.' }
+    $marker = Get-CatalogMarker -Document $Document
+    if ($null -ne $marker -and (Get-RootValue -Document $Document -Key 'model_catalog_json') -cne $marker.Data.ManagedPath) { throw 'Managed model catalog was externally changed. Restore a backup before switching.' }
+    if ($null -eq $marker) {
+        $existingCatalog = Get-RootEntry -Document $Document -Key 'model_catalog_json'
+        if ($null -ne $existingCatalog -and -not $ReplaceExistingCatalog) { throw 'An external model_catalog_json is configured. Use -ReplaceExistingCatalog after confirmation; the previous value will be saved for restoration.' }
+        $original = [ordered]@{ PreviousCatalog = $null; PreviousWindow = $null; PreviousCompact = $null; PreviousContextMarker = $null; ManagedPath = $null }
+        foreach ($pair in @(@('model_catalog_json', 'PreviousCatalog'), @('model_context_window', 'PreviousWindow'), @('model_auto_compact_token_limit', 'PreviousCompact'))) {
+            $entry = Get-RootEntry -Document $Document -Key $pair[0]
+            if ($null -ne $entry) { Assert-SingleLineManagedValue -Assignment $entry.Assignment -Key $pair[0]; $original[$pair[1]] = $entry.RawValue }
+        }
+        $contextMarker = Get-ContextMarker -Document $Document
+        if ($null -ne $contextMarker) { $original.PreviousContextMarker = $Document.Lines[$contextMarker.Index] }
+        $recovery = [pscustomobject]$original
+    } else { $recovery = $marker.Data; $Document.Lines.RemoveAt($marker.Index) }
+    $all = [System.Collections.Generic.List[object]]::new()
+    foreach ($item in @($list.Models)) {
+        if ($item.Id -ceq $ModelId) { continue }
+        # Unverified models are never silently advertised in Codex's picker.
+        if ($item.Verified) { $all.Add((New-CodexModelEntry -Metadata $item)) }
+    }
+    $all.Add((New-CodexModelEntry -Metadata $metadata))
+    $catalogJson = ConvertTo-Json -InputObject ([ordered]@{ models = @($all) }) -Depth 12
+    $hash = Get-Sha256Hex -Bytes ([Text.Encoding]::UTF8.GetBytes($catalogJson))
+    $stateLeaf = [IO.Path]::GetFileNameWithoutExtension((Get-ProviderModelStatePath -Definition $Definition))
+    $directory = Join-Path $script:ToolDataDir 'catalogs'
+    if (-not (Test-Path -LiteralPath $directory -PathType Container)) { New-Item -ItemType Directory -Path $directory -Force | Out-Null }
+    $catalogPath = Join-Path $directory ($stateLeaf + '-' + $hash + '.json')
+    if (-not (Test-Path -LiteralPath $catalogPath -PathType Leaf)) {
+        [IO.File]::WriteAllText($catalogPath, $catalogJson, [Text.UTF8Encoding]::new($false))
+    } elseif ((Get-Sha256Hex -Bytes ([IO.File]::ReadAllBytes($catalogPath))) -ne $hash) { throw 'Existing immutable model catalog was modified. Refusing to overwrite it.' }
+    $recovery.ManagedPath = $catalogPath
+    $markerText = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes(($recovery | ConvertTo-Json -Compress)))
+    $Document.Lines.Insert((Get-FirstTableIndex -Document $Document), ('# CST_CATALOG_V1 ' + $markerText))
+    Set-RootString -Document $Document -Key 'model_catalog_json' -Value $catalogPath
+    # Let per-model metadata drive limits when switching models in the native picker.
+    Remove-RootKey -Document $Document -Key 'model_context_window'
+    Remove-RootKey -Document $Document -Key 'model_auto_compact_token_limit'
+    Remove-ContextMarkers -Document $Document
+    return $metadata
+}
+
 function Get-CodexCatalogEntry {
     param([string]$ModelId)
     if ([string]::IsNullOrWhiteSpace($ModelId)) { return $null }
@@ -1040,8 +1334,14 @@ function Get-StatusObject {
             elseif ($envStatus.ProcessUserConflict) { [void]$warnings.Add("API-key environment variable '$($activeDefinition.EnvKey)' differs between the current Process and User scopes. Restart the launcher/Codex to avoid using a stale key.") }
         }
     }
+    $catalogMarker = Get-CatalogMarker -Document $document
+    $catalogManaged = $null -ne $catalogMarker -and $catalogMarker.Data.ManagedPath -ceq $catalogPath
     if (-not [string]::IsNullOrWhiteSpace($catalogPath)) {
-        [void]$warnings.Add('model_catalog_json is set. It may override the native model catalog; this tool leaves it untouched.')
+        if ($catalogManaged) { [void]$warnings.Add('Tool-managed provider model catalog is active. Fully restart Codex after switching or refreshing the applied catalog.') }
+        else { [void]$warnings.Add('An external model_catalog_json is set. It will be preserved unless you explicitly allow catalog management to replace it.') }
+    } elseif ($provider -ne 'openai') { [void]$warnings.Add('Custom provider has no model catalog. Codex may show Custom and still offer GPT models; do not select a GPT model for DeepSeek.') }
+    if ($null -ne $activeDefinition -and (Get-ModelProviderKind -Definition $activeDefinition) -in @('deepseek', 'iphy') -and $modelId -match '^(gpt-|codex-|o[134](?:-|$))') {
+        [void]$warnings.Add('MODEL/PROVIDER MISMATCH: DeepSeek provider is paired with an OpenAI model id. Reapply a DeepSeek model before sending a message.')
     }
 
     $codexCommand = Get-CodexCommand
@@ -1064,6 +1364,8 @@ function Get-StatusObject {
         ContextWindow = if ([string]::IsNullOrWhiteSpace($context)) { $null } else { $context }
         AutoCompactLimit = if ([string]::IsNullOrWhiteSpace($compact)) { $null } else { $compact }
         ContextManagedByTool = $null -ne $marker
+        CatalogPath = $catalogPath
+        CatalogManagedByTool = $catalogManaged
         ForcedLoginMethod = $forcedLogin
         PreferredAuthMethod = $preferredAuth
         Providers = $providerItems
@@ -1127,6 +1429,7 @@ function Assert-ModelId {
     if ($ModelId.Length -gt 256 -or $ModelId -match '[\x00-\x1F\x7F]') {
         throw 'Model id must be 256 characters or fewer and cannot contain control characters.'
     }
+    if ($ModelId -match '(?i)^sk-|^Bearer\s') { throw 'A secret-like value was entered as the model id. Put API keys in the API-key page, not in the model field.' }
 }
 
 function Show-SaveResult {
@@ -1159,6 +1462,16 @@ function Invoke-SetProviderOperation {
     $definition = Get-ProviderDefinition -Document $document -Id $Id
     if ($null -eq $definition) { throw "Provider '$Id' is not configured. Add/update it first." }
 
+    if ((Get-ModelProviderKind -Definition $definition) -in @('deepseek', 'iphy') -and $ModelId -match '^(gpt-|codex-|o[134](?:-|$))') { throw 'DeepSeek provider cannot use an OpenAI model id. Select a DeepSeek model or restore OpenAI.' }
+    foreach ($secret in @(Get-KnownSecretValues)) { if ($secret.Length -ge 4 -and $ModelId.Contains($secret)) { throw 'Model id contains a known credential. Nothing was saved.' } }
+    $metadata = $null
+    if ($ManageModelCatalog) {
+        $metadata = Enable-ProviderCatalog -Document $document -Definition $definition -ModelId $ModelId -Effort $Effort
+    } elseif ($null -ne (Get-CatalogMarker -Document $document)) {
+        # An old/automation caller must not leave another provider's managed catalog active.
+        Restore-ManagedCatalog -Document $document
+    }
+
     Set-RootString -Document $document -Key 'model_provider' -Value $Id
     Set-RootString -Document $document -Key 'model' -Value $ModelId
     if ([string]::IsNullOrWhiteSpace($Effort)) { Remove-RootKey -Document $document -Key 'model_reasoning_effort' }
@@ -1166,6 +1479,14 @@ function Invoke-SetProviderOperation {
 
     $result = Save-ConfigDocument -Document $document -Operation ('Switch provider to ' + $Id + ' model ' + $ModelId)
     Show-SaveResult -Result $result
+    try {
+        $state = Read-ProviderModelState -Definition $definition
+        $state.LastModel = $ModelId
+        $state.LastContextWindow = if ($null -ne $metadata) { $metadata.ContextWindow } else { $null }
+        if (@($state.ManualIds) -cnotcontains $ModelId) { $state.ManualIds = @($state.ManualIds) + @($ModelId) }
+        Save-ProviderModelState -Definition $definition -State $state
+    } catch { Write-Warning 'Configuration was saved, but the per-provider last-model preference could not be saved.' }
+    if ($null -ne $metadata -and -not $metadata.Verified) { Write-Warning 'Unverified model enabled with conservative text-only metadata. Responses/tool compatibility has not been tested.' }
     if (-not [string]::IsNullOrWhiteSpace($definition.EnvKey) -and -not (Get-EnvironmentStatus -Name $definition.EnvKey).Any) {
         Write-Warning "Provider API-key variable '$($definition.EnvKey)' is missing. Use the API-key menu before launching Codex."
     }
@@ -1177,12 +1498,13 @@ function Invoke-SetProviderOperation {
 
 function Invoke-UseOpenAIOperation {
     $document = Read-ConfigDocument
+    Restore-ManagedCatalog -Document $document
     Set-RootString -Document $document -Key 'model_provider' -Value 'openai'
     Remove-RootKey -Document $document -Key 'model'
     Remove-RootKey -Document $document -Key 'model_reasoning_effort'
     $result = Save-ConfigDocument -Document $document -Operation 'Switch to built-in OpenAI provider'
     Show-SaveResult -Result $result
-    Write-Host 'Custom provider blocks, context settings, login/auth preferences and API-key variables were preserved.' -ForegroundColor Cyan
+    Write-Host 'Tool-managed model catalog/context were restored to their pre-management values. Other provider, auth and API-key settings were preserved.' -ForegroundColor Cyan
     Write-Host 'This selects the built-in OpenAI provider; it does not change whether your existing auth method is ChatGPT login or an API key.' -ForegroundColor Yellow
 }
 
@@ -1846,6 +2168,16 @@ function Invoke-EntryPoint {
         switch ($Action) {
             'Menu' { Invoke-MainMenu }
             'Status' { Show-Status }
+            'ListModels' {
+                if ([string]::IsNullOrWhiteSpace($ProviderId)) { throw 'ListModels requires -ProviderId.' }
+                $result = Get-ProviderModels -Id $ProviderId
+                if ($Json) { Write-Output ($result | ConvertTo-Json -Depth 8) } else { $result.Models | Format-Table Id, Verified, SupportsImages, ContextWindow, Source -AutoSize }
+            }
+            'RefreshModels' {
+                if ([string]::IsNullOrWhiteSpace($ProviderId)) { throw 'RefreshModels requires -ProviderId.' }
+                $result = Invoke-RefreshModels -Id $ProviderId
+                if ($Json) { Write-Output ($result | ConvertTo-Json -Depth 8) } else { $result.Models | Format-Table Id, Verified, SupportsImages, ContextWindow, Source -AutoSize }
+            }
             'UseOpenAI' { Invoke-UseOpenAIOperation }
             'ConfigureProvider' {
                 if ([string]::IsNullOrWhiteSpace($ProviderId) -or [string]::IsNullOrWhiteSpace($BaseUrl)) { throw 'ConfigureProvider requires -ProviderId and -BaseUrl.' }

@@ -19,8 +19,8 @@ using System.Web.Script.Serialization;
 [assembly: AssemblyTitle("Codex 配置切换工具")]
 [assembly: AssemblyDescription("中文 Codex Provider、模型、上下文、密钥与备份管理工具")]
 [assembly: AssemblyProduct("Codex Switch Tools")]
-[assembly: AssemblyVersion("1.1.1.0")]
-[assembly: AssemblyFileVersion("1.1.1.0")]
+[assembly: AssemblyVersion("1.2.0.0")]
+[assembly: AssemblyFileVersion("1.2.0.0")]
 
 namespace CodexSwitchToolsGui
 {
@@ -394,6 +394,69 @@ namespace CodexSwitchToolsGui
         }
     }
 
+    internal sealed class ModelView
+    {
+        internal string Id = string.Empty;
+        internal string DisplayName = string.Empty;
+        internal bool Verified;
+        internal bool SupportsImages;
+        internal string ContextWindow = string.Empty;
+        internal string Source = string.Empty;
+        internal readonly List<string> ReasoningLevels = new List<string>();
+
+        public override string ToString()
+        {
+            string name = string.IsNullOrWhiteSpace(DisplayName) || DisplayName == Id ? Id : DisplayName + " — " + Id;
+            return name + (!Verified ? "  [元数据未验证]" : SupportsImages ? "  [图片 + 文本]" : "  [文本]");
+        }
+    }
+
+    internal sealed class ModelListSnapshot
+    {
+        internal string ProviderId = string.Empty;
+        internal string LastModel = string.Empty;
+        internal string RefreshedAt = string.Empty;
+        internal readonly List<ModelView> Models = new List<ModelView>();
+        internal readonly List<string> Warnings = new List<string>();
+
+        internal static ModelListSnapshot Parse(string json)
+        {
+            var root = new JavaScriptSerializer().DeserializeObject(json) as Dictionary<string, object>;
+            if (root == null) throw new InvalidDataException("模型列表 JSON 无法解析。");
+            var result = new ModelListSnapshot
+            {
+                ProviderId = StatusSnapshot.GetString(root, "ProviderId"),
+                LastModel = StatusSnapshot.GetString(root, "LastModel"),
+                RefreshedAt = StatusSnapshot.GetString(root, "RefreshedAt")
+            };
+            if (string.IsNullOrWhiteSpace(result.ProviderId)) throw new InvalidDataException("模型列表缺少 Provider ID。");
+            foreach (object item in StatusSnapshot.AsItems(StatusSnapshot.GetValue(root, "Models")))
+            {
+                var record = item as Dictionary<string, object>;
+                if (record == null) continue;
+                var model = new ModelView
+                {
+                    Id = StatusSnapshot.GetString(record, "Id"),
+                    DisplayName = StatusSnapshot.GetString(record, "DisplayName"),
+                    Verified = StatusSnapshot.GetBool(record, "Verified"),
+                    SupportsImages = StatusSnapshot.GetBool(record, "SupportsImages"),
+                    ContextWindow = StatusSnapshot.GetString(record, "ContextWindow"),
+                    Source = StatusSnapshot.GetString(record, "Source")
+                };
+                if (string.IsNullOrWhiteSpace(model.Id) || result.Models.Any(m => m.Id == model.Id)) continue;
+                foreach (object level in StatusSnapshot.AsItems(StatusSnapshot.GetValue(record, "ReasoningLevels")))
+                {
+                    string value = Convert.ToString(level);
+                    if (!string.IsNullOrWhiteSpace(value) && !model.ReasoningLevels.Contains(value)) model.ReasoningLevels.Add(value);
+                }
+                result.Models.Add(model);
+            }
+            foreach (object item in StatusSnapshot.AsItems(StatusSnapshot.GetValue(root, "Warnings")))
+                if (item != null) result.Warnings.Add(Convert.ToString(item));
+            return result;
+        }
+    }
+
     internal sealed class StatusSnapshot
     {
         internal string ToolVersion = string.Empty;
@@ -407,6 +470,8 @@ namespace CodexSwitchToolsGui
         internal string ContextWindow = string.Empty;
         internal string CompactLimit = string.Empty;
         internal bool ContextManaged;
+        internal string CatalogPath = string.Empty;
+        internal bool CatalogManaged;
         internal string ForcedLogin = string.Empty;
         internal string PreferredAuth = string.Empty;
         internal readonly List<ProviderView> Providers = new List<ProviderView>();
@@ -431,6 +496,8 @@ namespace CodexSwitchToolsGui
                 ContextWindow = GetString(root, "ContextWindow"),
                 CompactLimit = GetString(root, "AutoCompactLimit"),
                 ContextManaged = GetBool(root, "ContextManagedByTool"),
+                CatalogPath = GetString(root, "CatalogPath"),
+                CatalogManaged = GetBool(root, "CatalogManagedByTool"),
                 ForcedLogin = GetString(root, "ForcedLoginMethod"),
                 PreferredAuth = GetString(root, "PreferredAuthMethod")
             };
@@ -480,19 +547,19 @@ namespace CodexSwitchToolsGui
             return backups;
         }
 
-        private static object GetValue(Dictionary<string, object> source, string key)
+        internal static object GetValue(Dictionary<string, object> source, string key)
         {
             object value;
             return source.TryGetValue(key, out value) ? value : null;
         }
 
-        private static string GetString(Dictionary<string, object> source, string key)
+        internal static string GetString(Dictionary<string, object> source, string key)
         {
             object value = GetValue(source, key);
             return value == null ? string.Empty : Convert.ToString(value);
         }
 
-        private static bool GetBool(Dictionary<string, object> source, string key)
+        internal static bool GetBool(Dictionary<string, object> source, string key)
         {
             object value = GetValue(source, key);
             if (value is bool) return (bool)value;
@@ -500,7 +567,7 @@ namespace CodexSwitchToolsGui
             return value != null && bool.TryParse(Convert.ToString(value), out parsed) && parsed;
         }
 
-        private static IEnumerable<object> AsItems(object value)
+        internal static IEnumerable<object> AsItems(object value)
         {
             if (value == null) yield break;
             object[] array = value as object[];
@@ -570,6 +637,11 @@ namespace CodexSwitchToolsGui
         private readonly List<Control> actionControls = new List<Control>();
         private bool busy;
         private bool operationValidationSkipped;
+        private bool bindingModels;
+        private string displayedModelProvider = string.Empty;
+        private string nextRefreshProvider = string.Empty;
+        private readonly Dictionary<string, ModelListSnapshot> modelLists = new Dictionary<string, ModelListSnapshot>(StringComparer.OrdinalIgnoreCase);
+        private readonly Dictionary<string, string> selectedModels = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
         private StatusSnapshot status;
 
         private readonly TabControl tabs;
@@ -580,8 +652,13 @@ namespace CodexSwitchToolsGui
         private readonly TextBox overviewText;
 
         private readonly ComboBox switchProvider;
-        private readonly TextBox switchModel;
+        private readonly ComboBox switchModel;
         private readonly ComboBox switchEffort;
+        private readonly CheckBox manualModelEnabled;
+        private readonly TextBox manualModel;
+        private readonly TextBox manualModelContext;
+        private readonly Button refreshModels;
+        private readonly TextBox modelInfo;
         private readonly TextBox providerId;
         private readonly TextBox providerName;
         private readonly TextBox providerUrl;
@@ -620,13 +697,85 @@ namespace CodexSwitchToolsGui
             }
         }
 
+        internal bool RunModelSelectionSelfTest()
+        {
+            var sample = ModelListSnapshot.Parse("{\"ProviderId\":\"example\",\"LastModel\":\"example-vision\",\"Models\":[{\"Id\":\"example-text\",\"Verified\":true,\"SupportsImages\":false,\"ContextWindow\":32768,\"ReasoningLevels\":[\"low\",\"high\"]},{\"Id\":\"example-vision\",\"Verified\":true,\"SupportsImages\":true,\"ContextWindow\":65536,\"ReasoningLevels\":[\"high\",\"max\"]}],\"Warnings\":[]}");
+            status = new StatusSnapshot { Provider = "example", Model = "example-text", Effort = "high" };
+            bindingModels = true;
+            try
+            {
+                FillProviderCombo(switchProvider, new[]
+                {
+                    new ProviderView { Id = "openai" },
+                    new ProviderView { Id = "example" },
+                    new ProviderView { Id = "other" }
+                }, "example");
+            }
+            finally { bindingModels = false; }
+            ApplyModelSnapshot(sample);
+            if (SelectedModelId() != "example-text" || Convert.ToString(switchEffort.SelectedItem) != "high") return false;
+            switchModel.SelectedItem = sample.Models[1];
+            if (!SelectedModel().SupportsImages || !switchEffort.Items.Contains("max") || switchEffort.Items.Contains("low") || switchEffort.SelectedIndex != 0) return false;
+            RememberSelectedModel();
+            switchProvider.SelectedIndex = 2;
+            ApplyModelSnapshot(ModelListSnapshot.Parse("{\"ProviderId\":\"other\",\"LastModel\":\"other-text\",\"Models\":[{\"Id\":\"other-text\",\"Verified\":true,\"ReasoningLevels\":[]}]}"));
+            if (SelectedModelId() != "other-text" || switchEffort.Items.Count != 1) return false;
+            RememberSelectedModel();
+            switchProvider.SelectedIndex = 1;
+            ApplyModelSnapshot(sample);
+            if (SelectedModelId() != "example-vision") return false;
+            manualModelEnabled.Checked = true;
+            manualModel.Text = "unverified-new-vision";
+            if (SelectedModel() != null || switchEffort.Items.Count != 1 || switchEffort.Enabled || !manualModelContext.Enabled || switchModel.Enabled) return false;
+            if (modelInfo.Text.IndexOf("仅文本", StringComparison.Ordinal) < 0) return false;
+            manualModelEnabled.Checked = false;
+            if (SelectedModelId() != "example-vision" || !switchModel.Enabled || manualModel.Enabled) return false;
+            switchProvider.SelectedIndex = 0;
+            ApplyModelSnapshot(new ModelListSnapshot { ProviderId = "openai" });
+            if (switchModel.Enabled || refreshModels.Enabled || manualModelEnabled.Enabled) return false;
+            StatusSnapshot catalog = StatusSnapshot.Parse("{\"CatalogPath\":\"C:/catalog.json\",\"CatalogManagedByTool\":true}");
+            return catalog.CatalogManaged && catalog.CatalogPath == "C:/catalog.json";
+        }
+
+        internal void RenderPreviewForTest(string path)
+        {
+            if (!testMode) throw new InvalidOperationException("预览仅用于隔离自测。");
+            var previewStatus = new StatusSnapshot { Provider = "deepseek", Model = "deepseek-v4-flash-vision-exp", ConfigPath = "（合成预览，无真实配置）", CodexVersion = "preview" };
+            previewStatus.Providers.Add(new ProviderView { Id = "deepseek", Name = "DeepSeek（合成预览）", BaseUrl = "https://api.deepseek.com", EnvKey = "DEEPSEEK_API_KEY" });
+            ApplyStatus(previewStatus, "deepseek");
+            ApplyModelSnapshot(ModelListSnapshot.Parse("{\"ProviderId\":\"deepseek\",\"Models\":[{\"Id\":\"deepseek-v4-pro\",\"DisplayName\":\"DeepSeek V4 Pro\",\"Verified\":true,\"ContextWindow\":1048576,\"ReasoningLevels\":[\"low\",\"high\",\"max\"],\"Source\":\"preview-fixture\"},{\"Id\":\"deepseek-v4-flash-vision-exp\",\"DisplayName\":\"DeepSeek V4 Flash Vision Exp\",\"Verified\":true,\"SupportsImages\":true,\"ContextWindow\":1048576,\"ReasoningLevels\":[\"low\",\"high\",\"max\"],\"Source\":\"preview-fixture\"}]}"));
+            foreach (ModelView model in modelLists["deepseek"].Models) model.Source = "DeepSeek official Codex metadata (2026-09-02); not a live access check";
+            modelLists["deepseek"].Warnings.Add("Offline presets only. Refresh /models to discover models exposed to your key; discovery does not prove Responses/tool compatibility.");
+            modelLists["deepseek"].Warnings.Add("New model IDs do not reveal context, reasoning or image capabilities; unverified models require confirmation.");
+            UpdateSelectedModel();
+            tabs.SelectedIndex = 1;
+            ShowInTaskbar = false;
+            StartPosition = FormStartPosition.Manual;
+            Location = new Point(-32000, -32000);
+            Opacity = 0;
+            // Off-screen, transparent creation gives all nested WinForms controls handles.
+            // A hidden Form.DrawToBitmap alone otherwise produces an empty frame.
+            Show();
+            try
+            {
+                PerformLayout();
+                Update();
+                using (var bitmap = new Bitmap(Width, Height))
+                {
+                    DrawToBitmap(bitmap, new Rectangle(0, 0, Width, Height));
+                    bitmap.Save(Path.GetFullPath(path), System.Drawing.Imaging.ImageFormat.Png);
+                }
+            }
+            finally { Hide(); }
+        }
+
         internal MainForm(PowerShellBridge powerShellBridge, string overridePath, bool isTestMode)
         {
             bridge = powerShellBridge;
             configOverride = overridePath;
             testMode = isTestMode;
 
-            Text = "Codex 配置切换工具";
+            Text = "Codex 配置切换工具 v" + Assembly.GetExecutingAssembly().GetName().Version.ToString(3);
             Icon = ApplicationResources.LoadApplicationIcon();
             StartPosition = FormStartPosition.CenterScreen;
             MinimumSize = new Size(900, 650);
@@ -662,6 +811,8 @@ namespace CodexSwitchToolsGui
             tabs = new TabControl { Dock = DockStyle.Fill, Padding = new Point(18, 7) };
             TabPage overviewPage = new TabPage("状态总览");
             TabPage providerPage = new TabPage("Provider 与模型");
+            providerPage.AutoScroll = true;
+            providerPage.AutoScrollMinSize = new Size(850, 595);
             TabPage contextPage = new TabPage("上下文窗口");
             TabPage maintenancePage = new TabPage("密钥、备份与诊断");
             tabs.TabPages.AddRange(new[] { overviewPage, providerPage, contextPage, maintenancePage });
@@ -700,30 +851,40 @@ namespace CodexSwitchToolsGui
                 Left = 18,
                 Top = 14,
                 Width = 855,
-                Height = 170,
+                Height = 246,
                 Text = "切换持久 Provider 与请求模型"
             };
             switchProvider = new ComboBox { Left = 130, Top = 28, Width = 330, DropDownStyle = ComboBoxStyle.DropDownList };
-            switchModel = new TextBox { Left = 130, Top = 65, Width = 330 };
+            switchModel = new ComboBox { Left = 130, Top = 65, Width = 330, DropDownWidth = 690, DropDownStyle = ComboBoxStyle.DropDownList };
             switchEffort = new ComboBox { Left = 130, Top = 102, Width = 180, DropDownStyle = ComboBoxStyle.DropDownList };
-            switchEffort.Items.AddRange(new object[] { "（模型默认）", "none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra" });
+            switchEffort.Items.Add("（模型默认）");
             switchEffort.SelectedIndex = 0;
+            manualModelEnabled = new CheckBox { Left = 500, Top = 69, Width = 320, Text = "高级：手动输入模型 ID（通常不需要）" };
+            manualModel = new TextBox { Left = 130, Top = 139, Width = 330, Enabled = false };
+            manualModelContext = new TextBox { Left = 650, Top = 139, Width = 175, Enabled = false };
+            modelInfo = new TextBox { Left = 24, Top = 181, Width = 801, Height = 60, Multiline = true, ReadOnly = true, ScrollBars = ScrollBars.Vertical, BorderStyle = BorderStyle.None, BackColor = SystemColors.Control, TabStop = false, Text = "选择 Provider 后读取本地模型列表；联网更新请点“刷新模型列表”。" };
             switchGroup.Controls.Add(MakeLabel("Provider", 24, 32, 96));
-            switchGroup.Controls.Add(MakeLabel("模型 ID", 24, 69, 96));
+            switchGroup.Controls.Add(MakeLabel("模型", 24, 69, 96));
             switchGroup.Controls.Add(MakeLabel("推理强度", 24, 106, 96));
+            switchGroup.Controls.Add(MakeLabel("手动模型 ID", 24, 143, 104));
+            switchGroup.Controls.Add(MakeLabel("未验证模型上下文", 500, 143, 148));
             switchGroup.Controls.Add(switchProvider);
             switchGroup.Controls.Add(switchModel);
             switchGroup.Controls.Add(switchEffort);
-            Button applySwitch = MakeButton("应用选择", 500, 56, 145, delegate { ApplyProviderSwitch(); });
-            Button useOpenAi = MakeButton("恢复内置 OpenAI", 660, 56, 165, delegate { UseOpenAi(); });
+            switchGroup.Controls.AddRange(new Control[] { manualModelEnabled, manualModel, manualModelContext, modelInfo });
+            refreshModels = MakeButton("刷新模型列表", 500, 23, 145, delegate { LoadProviderModels(true); });
+            Button applySwitch = MakeButton("应用选择", 660, 95, 165, delegate { ApplyProviderSwitch(); });
+            Button useOpenAi = MakeButton("恢复内置 OpenAI", 660, 23, 165, delegate { UseOpenAi(); });
+            switchGroup.Controls.Add(refreshModels);
             switchGroup.Controls.Add(applySwitch);
             switchGroup.Controls.Add(useOpenAi);
+            actionControls.AddRange(new Control[] { switchProvider, switchModel, switchEffort, manualModelEnabled, manualModel, manualModelContext });
 
             var defineGroup = new GroupBox
             {
-                Anchor = AnchorStyles.Top | AnchorStyles.Bottom | AnchorStyles.Left | AnchorStyles.Right,
+                Anchor = AnchorStyles.Top | AnchorStyles.Left | AnchorStyles.Right,
                 Left = 18,
-                Top = 196,
+                Top = 270,
                 Width = 855,
                 Height = 325,
                 Text = "新增或更新通用 Responses API Provider"
@@ -845,6 +1006,23 @@ namespace CodexSwitchToolsGui
             Controls.Add(header);
             Controls.Add(footer);
 
+            switchProvider.SelectedIndexChanged += delegate
+            {
+                if (bindingModels || busy) return;
+                RememberSelectedModel();
+                if (!testMode) LoadProviderModels(false);
+            };
+            switchModel.SelectedIndexChanged += delegate { if (!bindingModels) UpdateSelectedModel(); };
+            manualModelEnabled.CheckedChanged += delegate
+            {
+                if (bindingModels) return;
+                ModelView selected = switchModel.SelectedItem as ModelView;
+                if (manualModelEnabled.Checked && selected != null) manualModel.Text = selected.Id;
+                UpdateSelectedModel();
+            };
+            manualModel.TextChanged += delegate { if (!bindingModels && manualModelEnabled.Checked) UpdateSelectedModel(); };
+            UpdateModelControls();
+
             FormClosing += delegate(object sender, FormClosingEventArgs e)
             {
                 if (!busy || e.CloseReason != CloseReason.UserClosing) return;
@@ -875,6 +1053,9 @@ namespace CodexSwitchToolsGui
         private void RefreshAll()
         {
             if (busy) return;
+            RememberSelectedModel();
+            string desiredProvider = string.IsNullOrWhiteSpace(nextRefreshProvider) ? SelectedProviderId(switchProvider) : nextRefreshProvider;
+            nextRefreshProvider = string.Empty;
             SetBusy(true, "正在读取持久配置……");
             var worker = new BackgroundWorker();
             worker.DoWork += delegate(object sender, DoWorkEventArgs e)
@@ -885,7 +1066,17 @@ namespace CodexSwitchToolsGui
 
                 CommandResult backupResult = bridge.Run(Args("ListBackups").Concat(new[] { "-Json" }), null);
                 if (!backupResult.Success) throw new InvalidOperationException(backupResult.CombinedOutput);
-                e.Result = new object[] { snapshot, StatusSnapshot.ParseBackups(backupResult.StandardOutput) };
+                string provider = desiredProvider;
+                if (string.IsNullOrWhiteSpace(provider) || (provider != "openai" && !snapshot.Providers.Any(p => string.Equals(p.Id, provider, StringComparison.OrdinalIgnoreCase)))) provider = snapshot.Provider;
+                CommandResult modelsResult = bridge.Run(Args("ListModels").Concat(new[] { "-ProviderId", provider, "-Json" }), null);
+                ModelListSnapshot models = null;
+                string modelError = modelsResult.Success ? string.Empty : modelsResult.CombinedOutput;
+                if (modelsResult.Success)
+                {
+                    try { models = ModelListSnapshot.Parse(modelsResult.StandardOutput); }
+                    catch (Exception ex) { modelError = ex.Message; }
+                }
+                e.Result = new object[] { snapshot, StatusSnapshot.ParseBackups(backupResult.StandardOutput), provider, models, modelError };
             };
             worker.RunWorkerCompleted += delegate(object sender, RunWorkerCompletedEventArgs e)
             {
@@ -899,8 +1090,15 @@ namespace CodexSwitchToolsGui
                 object[] result = (object[])e.Result;
                 try
                 {
-                    ApplyStatus((StatusSnapshot)result[0]);
+                    ApplyStatus((StatusSnapshot)result[0], (string)result[2]);
                     ApplyBackups((List<BackupView>)result[1]);
+                    ModelListSnapshot models = result[3] as ModelListSnapshot;
+                    if (models != null) ApplyModelSnapshot(models);
+                    else
+                    {
+                        BindCachedModels((string)result[2]);
+                        modelInfo.Text = "模型列表读取失败；保留本地旧列表，可重试或使用高级手动 ID。\r\n" + Convert.ToString(result[4]);
+                    }
                 }
                 catch (Exception bindError) { ShowError("状态显示失败", bindError.Message); }
             };
@@ -948,8 +1146,20 @@ namespace CodexSwitchToolsGui
             worker.RunWorkerAsync();
         }
 
-        private void ApplyStatus(StatusSnapshot snapshot)
+        private void ApplyStatus(StatusSnapshot snapshot, string desiredProvider)
         {
+            if (status != null)
+            {
+                foreach (ProviderView previous in status.Providers)
+                {
+                    ProviderView current = snapshot.Providers.FirstOrDefault(p => string.Equals(p.Id, previous.Id, StringComparison.OrdinalIgnoreCase));
+                    if (current == null || !string.Equals(current.BaseUrl, previous.BaseUrl, StringComparison.Ordinal))
+                    {
+                        modelLists.Remove(previous.Id);
+                        selectedModels.Remove(previous.Id);
+                    }
+                }
+            }
             status = snapshot;
             string model = string.IsNullOrWhiteSpace(status.Model) ? "UI / 模型默认" : status.Model;
             overviewSummary.Text = "预计下次启动：" + status.Provider + "  /  " + model;
@@ -967,6 +1177,8 @@ namespace CodexSwitchToolsGui
             sb.AppendLine("上下文       : " + ValueOr(status.ContextWindow, "模型默认"));
             sb.AppendLine("自动压缩     : " + ValueOr(status.CompactLimit, "模型默认"));
             sb.AppendLine("工具管理上下文: " + (status.ContextManaged ? "是" : "否"));
+            sb.AppendLine("模型目录     : " + ValueOr(status.CatalogPath, "Codex 原生目录"));
+            sb.AppendLine("工具管理目录 : " + (status.CatalogManaged ? "是" : "否"));
             sb.AppendLine("强制登录方式 : " + ValueOr(status.ForcedLogin, "未强制"));
             sb.AppendLine("偏好认证方式 : " + ValueOr(status.PreferredAuth, "Codex 默认"));
             sb.AppendLine();
@@ -993,14 +1205,13 @@ namespace CodexSwitchToolsGui
             }
             overviewText.Text = sb.ToString();
 
-            string selectedSwitch = SelectedProviderId(switchProvider);
             string selectedKey = SelectedProviderId(keyProvider);
             var allProviders = new List<ProviderView> { new ProviderView { Id = "openai", Name = "内置 OpenAI" } };
             allProviders.AddRange(status.Providers);
-            FillProviderCombo(switchProvider, allProviders, string.IsNullOrWhiteSpace(selectedSwitch) ? status.Provider : selectedSwitch);
+            bindingModels = true;
+            try { FillProviderCombo(switchProvider, allProviders, string.IsNullOrWhiteSpace(desiredProvider) ? status.Provider : desiredProvider); }
+            finally { bindingModels = false; }
             FillProviderCombo(keyProvider, status.Providers, selectedKey);
-            switchModel.Text = status.Model;
-            SelectEffort(status.Effort);
             contextCurrent.Text = string.Format(
                 "当前 Provider：{0}    模型：{1}\r\n上下文：{2}    自动压缩：{3}    工具管理：{4}",
                 status.Provider,
@@ -1060,6 +1271,165 @@ namespace CodexSwitchToolsGui
             switchEffort.SelectedIndex = 0;
         }
 
+        private string SelectedModelId()
+        {
+            if (manualModelEnabled.Checked) return manualModel.Text.Trim();
+            ModelView selected = switchModel.SelectedItem as ModelView;
+            return selected == null ? string.Empty : selected.Id;
+        }
+
+        private ModelView SelectedModel()
+        {
+            string id = SelectedModelId();
+            ModelListSnapshot list;
+            if (modelLists.TryGetValue(SelectedProviderId(switchProvider), out list))
+                return list.Models.FirstOrDefault(m => string.Equals(m.Id, id, StringComparison.Ordinal));
+            return null;
+        }
+
+        private void RememberSelectedModel()
+        {
+            string id = SelectedModelId();
+            if (!string.IsNullOrWhiteSpace(displayedModelProvider) && !string.IsNullOrWhiteSpace(id)) selectedModels[displayedModelProvider] = id;
+        }
+
+        private void BindCachedModels(string providerId)
+        {
+            ModelListSnapshot cached;
+            if (!modelLists.TryGetValue(providerId, out cached)) cached = new ModelListSnapshot { ProviderId = providerId };
+            ApplyModelSnapshot(cached);
+        }
+
+        private void ApplyModelSnapshot(ModelListSnapshot snapshot)
+        {
+            string providerId = SelectedProviderId(switchProvider);
+            if (!string.Equals(snapshot.ProviderId, providerId, StringComparison.OrdinalIgnoreCase))
+                throw new InvalidDataException("模型列表所属 Provider 与当前选择不一致，已拒绝显示。");
+            modelLists[providerId] = snapshot;
+            string desired;
+            if (!selectedModels.TryGetValue(providerId, out desired))
+                desired = status != null && string.Equals(status.Provider, providerId, StringComparison.OrdinalIgnoreCase) && !string.IsNullOrWhiteSpace(status.Model)
+                    ? status.Model : snapshot.LastModel;
+            if (!string.IsNullOrWhiteSpace(desired) && !snapshot.Models.Any(m => m.Id == desired))
+                snapshot.Models.Add(new ModelView { Id = desired, DisplayName = desired, ContextWindow = "32768", Source = "previous-selection" });
+            bindingModels = true;
+            try
+            {
+                displayedModelProvider = providerId;
+                switchModel.BeginUpdate();
+                switchModel.Items.Clear();
+                foreach (ModelView model in snapshot.Models) switchModel.Items.Add(model);
+                switchModel.EndUpdate();
+                ModelView chosen = snapshot.Models.FirstOrDefault(m => m.Id == desired)
+                    ?? snapshot.Models.FirstOrDefault(m => m.Verified) ?? snapshot.Models.FirstOrDefault();
+                if (chosen != null) switchModel.SelectedItem = chosen;
+                manualModelEnabled.Checked = false;
+                manualModel.Text = chosen == null ? string.Empty : chosen.Id;
+                manualModelContext.Clear();
+            }
+            finally { bindingModels = false; }
+            UpdateSelectedModel();
+        }
+
+        private void UpdateSelectedModel()
+        {
+            ModelView model = SelectedModel();
+            string provider = SelectedProviderId(switchProvider);
+            switchEffort.BeginUpdate();
+            switchEffort.Items.Clear();
+            switchEffort.Items.Add("（模型默认）");
+            if (model != null && model.Verified)
+                foreach (string level in model.ReasoningLevels) switchEffort.Items.Add(level);
+            switchEffort.SelectedIndex = 0;
+            switchEffort.EndUpdate();
+            if (model != null && status != null && string.Equals(status.Provider, provider, StringComparison.OrdinalIgnoreCase) && status.Model == model.Id)
+                SelectEffort(status.Effort);
+
+            if (provider == "openai")
+                modelInfo.Text = "内置 OpenAI：点“恢复内置 OpenAI”后，在 Codex 自己的模型菜单中选择。\r\n本工具不接管 OpenAI 模型目录；切回时恢复接管前目录与上下文，登录方式不变。";
+            else
+            {
+                ModelListSnapshot list;
+                modelLists.TryGetValue(provider, out list);
+                string fallbackContext = model == null || string.IsNullOrWhiteSpace(model.ContextWindow) ? "32768" : model.ContextWindow;
+                string detail = model == null || !model.Verified
+                    ? "模型元数据未验证：仅文本；当前上下文 " + fallbackContext + " tokens（已保存值或保守默认）；可在高级设置指定。"
+                    : (model.SupportsImages ? "支持图片 + 文本" : "仅文本") + "；上下文：" + ValueOr(model.ContextWindow, "未提供") + " tokens；来源：" + ValueOr(model.Source, "已验证目录");
+                string refreshed = list == null || string.IsNullOrWhiteSpace(list.RefreshedAt) ? "本地内置/缓存列表" : "上次联网刷新：" + list.RefreshedAt;
+                string warning = list != null && list.Warnings.Count > 0 ? "\r\n提示：" + string.Join("\r\n", list.Warnings.ToArray()) : string.Empty;
+                modelInfo.Text = detail + "\r\n" + refreshed + "。刷新只获取模型名单，不发送对话。" + warning;
+            }
+            UpdateModelControls();
+        }
+
+        private void UpdateModelControls()
+        {
+            bool custom = !string.IsNullOrWhiteSpace(SelectedProviderId(switchProvider)) && SelectedProviderId(switchProvider) != "openai";
+            ModelView selected = SelectedModel();
+            switchModel.Enabled = !busy && custom && !manualModelEnabled.Checked;
+            manualModelEnabled.Enabled = !busy && custom;
+            manualModel.Enabled = !busy && custom && manualModelEnabled.Checked;
+            manualModelContext.Enabled = !busy && custom && manualModelEnabled.Checked && (selected == null || !selected.Verified);
+            switchEffort.Enabled = !busy && custom && selected != null && selected.Verified && switchEffort.Items.Count > 1;
+            refreshModels.Enabled = !busy && custom;
+        }
+
+        private void LoadProviderModels(bool refresh)
+        {
+            if (busy) return;
+            ProviderView provider = switchProvider.SelectedItem as ProviderView;
+            if (provider == null) return;
+            RememberSelectedModel();
+            if (refresh)
+            {
+                if (provider.Id == "openai") return;
+                string message = "将向以下 Provider 获取可用模型列表：\r\n\r\n" + provider.Id + "\r\nBase URL：" + provider.BaseUrl +
+                    "\r\n\r\n只调用 GET /models，不发送对话、图片或生成请求。若该 Provider 使用 API Key，请求会携带对应 Key；请确认网址可信。服务商可能有自己的接口访问规则。\r\n\r\n刷新失败会保留旧列表。是否继续？";
+                if (MessageBox.Show(this, message, "确认联网刷新模型", MessageBoxButtons.YesNo, MessageBoxIcon.Information, MessageBoxDefaultButton.Button2) != DialogResult.Yes) return;
+                if (provider.ProcessUserKeyConflict)
+                {
+                    if (MessageBox.Show(this, "当前进程与 User 保存的 API Key 不一致。是否先同步为 User 值再刷新？", "检测到旧 Key 冲突", MessageBoxButtons.YesNo, MessageBoxIcon.Warning, MessageBoxDefaultButton.Button2) != DialogResult.Yes) return;
+                    if (!SynchronizeProcessEnvironment(provider.EnvKey))
+                        MessageBox.Show(this, "本工具当前进程已同步 Key，但 Windows 广播失败。之后请完全重启启动器与 Codex。", "系统广播失败", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                }
+            }
+            BindCachedModels(provider.Id);
+            var args = Args(refresh ? "RefreshModels" : "ListModels");
+            args.AddRange(new[] { "-ProviderId", provider.Id, "-Json" });
+            if (refresh) args.Add("-ConfirmModelRefresh");
+            SetBusy(true, refresh ? "正在联网刷新模型名单……" : "正在读取本地模型名单……");
+            var worker = new BackgroundWorker();
+            worker.DoWork += delegate(object sender, DoWorkEventArgs e)
+            {
+                CommandResult result = bridge.Run(args, null);
+                if (!result.Success) throw new InvalidOperationException(result.CombinedOutput);
+                e.Result = ModelListSnapshot.Parse(result.StandardOutput);
+            };
+            worker.RunWorkerCompleted += delegate(object sender, RunWorkerCompletedEventArgs e)
+            {
+                if (IsDisposed) return;
+                SetBusy(false, "准备就绪");
+                if (e.Error != null)
+                {
+                    modelInfo.Text = "模型列表读取失败；已保留此 Provider 的旧列表，可重试或使用高级手动 ID。";
+                    ShowError("模型列表读取失败", e.Error.Message + "\r\n\r\n此前模型列表与 Codex 配置均未由本次读取替换。");
+                    return;
+                }
+                try
+                {
+                    ApplyModelSnapshot((ModelListSnapshot)e.Result);
+                    if (refresh)
+                    {
+                        ModelListSnapshot result = (ModelListSnapshot)e.Result;
+                        string warnings = result.Warnings.Count > 0 ? "\r\n\r\n" + string.Join("\r\n", result.Warnings.ToArray()) : string.Empty;
+                        ShowSuccess("模型名单已刷新", "已获取 " + result.Models.Count + " 个模型。请选择所需模型并点“应用选择”，然后完全重启 Codex，更新才会应用到原生模型目录。" + warnings);
+                    }
+                }
+                catch (Exception ex) { ShowError("模型列表显示失败", ex.Message); }
+            };
+            worker.RunWorkerAsync();
+        }
+
         private void SelectBackup(string name)
         {
             for (int i = 0; i < backups.Items.Count; i++)
@@ -1071,27 +1441,57 @@ namespace CodexSwitchToolsGui
             ProviderView provider = switchProvider.SelectedItem as ProviderView;
             if (provider == null) { ShowError("缺少选择", "请先选择 Provider。"); return; }
             if (provider.Id == "openai") { UseOpenAi(); return; }
-            if (string.IsNullOrWhiteSpace(switchModel.Text)) { ShowError("缺少模型", "第三方 Provider 必须填写模型 ID。"); return; }
+            string modelId = SelectedModelId();
+            if (string.IsNullOrWhiteSpace(modelId)) { ShowError("缺少模型", "请先选择模型；列表为空时可刷新，或启用高级手动 ID。"); return; }
+            ModelView model = SelectedModel();
+            bool unverified = model == null || !model.Verified;
+            long customContext = 0;
+            if (unverified && manualModelEnabled.Checked && !string.IsNullOrWhiteSpace(manualModelContext.Text) &&
+                (!long.TryParse(manualModelContext.Text.Trim(), out customContext) || customContext < 1024 || customContext > 10000000))
+            {
+                ShowError("上下文无效", "未验证模型的上下文必须是 1024 至 10000000 的整数 tokens；留空使用已保存值，未保存过则默认 32768。");
+                return;
+            }
+            if (unverified && customContext == 0 &&
+                (model == null || !long.TryParse(model.ContextWindow, out customContext) || customContext < 1024 || customContext > 10000000)) customContext = 32768;
             var warnings = new List<string>();
             if (!string.IsNullOrWhiteSpace(provider.EnvKey) && !provider.KeyPresent)
                 warnings.Add("API Key 环境变量 “" + provider.EnvKey + "” 当前不可见，切换后可能无法请求。");
-            if (status != null && !string.IsNullOrWhiteSpace(status.ContextWindow))
-                warnings.Add("现有上下文覆盖 " + status.ContextWindow + " 会被保留，请确认目标 Provider 支持。");
             if (warnings.Count > 0)
             {
                 string message = string.Join("\r\n", warnings.ToArray()) + "\r\n\r\n仍要继续切换吗？";
                 if (MessageBox.Show(this, message, "切换前警告", MessageBoxButtons.YesNo, MessageBoxIcon.Warning, MessageBoxDefaultButton.Button2) != DialogResult.Yes) return;
             }
+            if (unverified)
+            {
+                string fallbackContext = model == null || string.IsNullOrWhiteSpace(model.ContextWindow) ? "32768" : model.ContextWindow;
+                string warning = "模型 “" + modelId + "” 的能力元数据尚未验证。仅知道模型名不能证明其支持图片、工具调用或大上下文。\r\n\r\n本次按仅文本配置；上下文：" + (customContext > 0 ? customContext.ToString() : fallbackContext + "（已保存值或保守默认）") + " tokens。不会自动开启图片输入或推理档位。请确认此 ID 确实属于目标 Provider。\r\n\r\n仍要继续吗？";
+                if (MessageBox.Show(this, warning, "确认使用未验证模型", MessageBoxButtons.YesNo, MessageBoxIcon.Warning, MessageBoxDefaultButton.Button2) != DialogResult.Yes) return;
+            }
+            bool replaceCatalog = status != null && !string.IsNullOrWhiteSpace(status.CatalogPath) && !status.CatalogManaged;
+            if (replaceCatalog && MessageBox.Show(this, "检测到非本工具管理的模型目录：\r\n" + status.CatalogPath + "\r\n\r\n本次切换将暂时接管 model_catalog_json 并保留原设置；切回 OpenAI 时恢复。原目录文件不会被覆盖。\r\n\r\n是否允许接管？", "确认接管现有模型目录", MessageBoxButtons.YesNo, MessageBoxIcon.Warning, MessageBoxDefaultButton.Button2) != DialogResult.Yes) return;
             var args = Args("SetProvider");
-            args.AddRange(new[] { "-ProviderId", provider.Id, "-Model", switchModel.Text.Trim() });
+            args.AddRange(new[] { "-ProviderId", provider.Id, "-Model", modelId, "-ManageModelCatalog" });
+            if (unverified) args.Add("-AllowUnverifiedModel");
+            if (customContext > 0) args.AddRange(new[] { "-ContextWindow", customContext.ToString() });
+            if (replaceCatalog) args.Add("-ReplaceExistingCatalog");
             if (switchEffort.SelectedIndex > 0) args.AddRange(new[] { "-ReasoningEffort", Convert.ToString(switchEffort.SelectedItem) });
-            RunAction("正在切换 Provider 与模型……", args, null, true, delegate { ShowSuccess("切换成功", "持久配置已更新。请完全退出并重启 Codex / VS Code。"); });
+            RunAction("正在切换 Provider、模型与独立目录……", args, null, true, delegate
+            {
+                selectedModels[provider.Id] = modelId;
+                nextRefreshProvider = provider.Id;
+                ShowSuccess("切换成功", "持久配置与 Provider 独立模型目录已更新。请完全退出并重启 Codex / VS Code，目录不会在当前运行进程里热更新。\r\n\r\nWindows 版 Codex 仍可能显示“自定义 / Custom”；该标签不等于切换失败。不要在第三方 Provider 下选择未受其支持的 GPT 模型。旧任务也可能保留自己的模型设置，请核对后再继续。");
+            });
         }
 
         private void UseOpenAi()
         {
-            if (MessageBox.Show(this, "将切换到内置 OpenAI Provider，并移除自定义模型/推理强度覆盖。上下文与登录方式会保留。\r\n\r\n是否继续？", "恢复内置 OpenAI", MessageBoxButtons.YesNo, MessageBoxIcon.Warning, MessageBoxDefaultButton.Button2) != DialogResult.Yes) return;
-            RunAction("正在恢复内置 OpenAI……", Args("UseOpenAI"), null, true, delegate { ShowSuccess("操作成功", "已选择内置 OpenAI Provider。请重启 Codex。登录方式未被修改。"); });
+            if (MessageBox.Show(this, "将切换到内置 OpenAI Provider，移除第三方模型/推理强度覆盖；若模型目录由本工具接管，将恢复接管前的目录与上下文。登录方式不变。\r\n\r\n是否继续？", "恢复内置 OpenAI", MessageBoxButtons.YesNo, MessageBoxIcon.Warning, MessageBoxDefaultButton.Button2) != DialogResult.Yes) return;
+            RunAction("正在恢复内置 OpenAI……", Args("UseOpenAI"), null, true, delegate
+            {
+                nextRefreshProvider = "openai";
+                ShowSuccess("操作成功", "已选择内置 OpenAI Provider。请完全退出并重启 Codex，再在其原生模型菜单选择。登录方式未被修改。");
+            });
         }
 
         private void FillProviderForm()
@@ -1416,6 +1816,7 @@ namespace CodexSwitchToolsGui
             busy = value;
             UseWaitCursor = value;
             foreach (Control control in actionControls) control.Enabled = !value;
+            UpdateModelControls();
             closeButton.Enabled = !value;
             bottomStatus.Text = text;
         }
@@ -1481,6 +1882,9 @@ namespace CodexSwitchToolsGui
                                 if (form.TabCountForTest != 4 || !form.TabTitlesForTest.SequenceEqual(expectedTabs)) selfTestCode = 22;
                                 else if (form.Icon == null || form.Icon.Width < 16 || form.Icon.Height < 16) selfTestCode = 27;
                                 else if (!MainForm.RunEnvironmentSynchronizationSelfTest()) selfTestCode = 24;
+                                else if (!form.RunModelSelectionSelfTest()) selfTestCode = 28;
+                                string previewPath = Environment.GetEnvironmentVariable("CST_GUI_PREVIEW_PATH");
+                                if (selfTestCode == 0 && !string.IsNullOrWhiteSpace(previewPath)) form.RenderPreviewForTest(previewPath);
                             }
                         }
                     }

@@ -64,35 +64,50 @@ function Invoke-SelfTest {
     }
 }
 
-function Assert-ExecutableIcon {
-    param([string]$ExePath, [string]$ExpectedIconPath)
+function Read-NativeIconBitmap {
+    param([string]$Path, [int]$Size)
     [IntPtr[]]$handles = @([IntPtr]::Zero)
     [uint32[]]$iconIds = @(0)
-    $count = [CodexSwitchToolsNativeIconTest]::PrivateExtractIcons($ExePath, 0, 32, 32, $handles, $iconIds, 1, 0)
-    if ($count -ne 1 -or $handles[0] -eq [IntPtr]::Zero) { throw "Executable icon is missing: $ExePath" }
-    $actualIcon = $null
-    $expectedIcon = $null
-    $actualBitmap = $null
-    $expectedBitmap = $null
+    $count = [CodexSwitchToolsNativeIconTest]::PrivateExtractIcons($Path, 0, $Size, $Size, $handles, $iconIds, 1, 0)
+    if ($count -ne 1 -or $handles[0] -eq [IntPtr]::Zero) { throw "Native icon extraction failed at ${Size}px: $Path" }
+    $icon = $null
     try {
         $view = [Drawing.Icon]::FromHandle($handles[0])
-        $actualIcon = [Drawing.Icon]$view.Clone()
-        $expectedIcon = [Drawing.Icon]::new($ExpectedIconPath, 32, 32)
-        $actualBitmap = $actualIcon.ToBitmap()
-        $expectedBitmap = $expectedIcon.ToBitmap()
-        $differentPixels = 0
-        for ($y = 0; $y -lt 32; $y++) {
-            for ($x = 0; $x -lt 32; $x++) {
-                if ($actualBitmap.GetPixel($x, $y).ToArgb() -ne $expectedBitmap.GetPixel($x, $y).ToArgb()) { $differentPixels++ }
-            }
-        }
-        if ($differentPixels -ne 0) { throw "Executable does not contain the expected custom icon ($differentPixels pixels differ): $ExePath" }
+        $icon = [Drawing.Icon]$view.Clone()
+        return $icon.ToBitmap()
     } finally {
-        if ($null -ne $actualBitmap) { $actualBitmap.Dispose() }
-        if ($null -ne $expectedBitmap) { $expectedBitmap.Dispose() }
-        if ($null -ne $actualIcon) { $actualIcon.Dispose() }
-        if ($null -ne $expectedIcon) { $expectedIcon.Dispose() }
+        if ($null -ne $icon) { $icon.Dispose() }
         [void][CodexSwitchToolsNativeIconTest]::DestroyIcon($handles[0])
+    }
+}
+
+function Assert-ExecutableIcon {
+    param([string]$ExePath, [string]$ExpectedIconPath)
+    # Decode both the PE resource and source ICO through the same Windows API.
+    # .NET Framework Icon(file, size).ToBitmap() can misdecode PNG-backed ICO
+    # frames even when PrivateExtractIcons renders the source and EXE identically.
+    # Exact comparisons at taskbar/title-bar/large-icon sizes remain mandatory.
+    foreach ($size in @(16, 32, 48, 256)) {
+        $actualBitmap = $null
+        $expectedBitmap = $null
+        try {
+            $actualBitmap = Read-NativeIconBitmap -Path $ExePath -Size $size
+            $expectedBitmap = Read-NativeIconBitmap -Path $ExpectedIconPath -Size $size
+            if ($actualBitmap.Width -ne $size -or $actualBitmap.Height -ne $size -or
+                $expectedBitmap.Width -ne $size -or $expectedBitmap.Height -ne $size) {
+                throw "Native icon extraction returned an unexpected size for ${size}px: $ExePath"
+            }
+            $differentPixels = 0
+            for ($y = 0; $y -lt $size; $y++) {
+                for ($x = 0; $x -lt $size; $x++) {
+                    if ($actualBitmap.GetPixel($x, $y).ToArgb() -ne $expectedBitmap.GetPixel($x, $y).ToArgb()) { $differentPixels++ }
+                }
+            }
+            if ($differentPixels -ne 0) { throw "Executable does not contain the expected custom icon ($differentPixels pixels differ at ${size}px): $ExePath" }
+        } finally {
+            if ($null -ne $actualBitmap) { $actualBitmap.Dispose() }
+            if ($null -ne $expectedBitmap) { $expectedBitmap.Dispose() }
+        }
     }
 }
 
@@ -124,6 +139,16 @@ try {
     $committedHash = (Get-FileHash -Algorithm SHA256 -LiteralPath $committedExe).Hash
     if ($expectedHash -ne $committedHash) { throw 'SHA256SUMS.txt does not match the committed GUI executable.' }
     Assert-ExecutableIcon -ExePath $committedExe -ExpectedIconPath $iconPath
+    $wrongIconPath = Join-Path $testRoot 'negative-control.ico'
+    $wrongIconStream = [IO.File]::Create($wrongIconPath)
+    try { [Drawing.SystemIcons]::Warning.Save($wrongIconStream) } finally { $wrongIconStream.Dispose() }
+    $wrongIconRejected = $false
+    try { Assert-ExecutableIcon -ExePath $committedExe -ExpectedIconPath $wrongIconPath }
+    catch {
+        if ($_.Exception.Message -notlike 'Executable does not contain the expected custom icon*') { throw }
+        $wrongIconRejected = $true
+    }
+    if (-not $wrongIconRejected) { throw 'Icon comparison failed to reject a deliberately different icon.' }
     $committedExit = Invoke-SelfTest -ExePath $committedExe -FixturePath $configPath -SourceHash $sourceHash -CoreHash $coreHash
     if ($committedExit -ne 0) { throw "Committed GUI executable self-test failed. Exit=$committedExit" }
 
@@ -141,13 +166,14 @@ try {
     if ($beforeHash -ne $afterHash) { throw 'GUI self-test changed its isolated config.' }
 
     $version = (Get-Item -LiteralPath $outputPath).VersionInfo.FileVersion
-    if ($version -notmatch '^1\.1\.1\.0') { throw "Unexpected GUI file version: $version" }
+    if ($version -notmatch '^1\.2\.0\.0') { throw "Unexpected GUI file version: $version" }
 
     Write-Host '[PASS] GUI compiled and created four Chinese tabs without showing a window.' -ForegroundColor Green
     Write-Host '[PASS] Committed GUI executable matched SHA256SUMS and its embedded core self-test passed.' -ForegroundColor Green
     Write-Host '[PASS] Embedded core worked through preferred PowerShell and Windows PowerShell 5.1 fallback.' -ForegroundColor Green
     Write-Host '[PASS] Four expected Chinese tab captions and stale Process-key synchronization were self-tested.' -ForegroundColor Green
     Write-Host '[PASS] The custom icon is embedded in both the executable and the WinForms window.' -ForegroundColor Green
+    Write-Host '[PASS] Native icon pixels match the source at 16/32/48/256px; a different icon was rejected.' -ForegroundColor Green
     Write-Host '[PASS] GUI self-test cleaned its random extracted-core directory.' -ForegroundColor Green
     Write-Host '[PASS] GUI self-test preserved the isolated config byte-for-byte.' -ForegroundColor Green
 } finally {

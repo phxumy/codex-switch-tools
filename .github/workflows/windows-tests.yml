@@ -2,7 +2,10 @@ name: Windows compatibility tests
 
 on:
   push:
+    branches:
+      - '**'
   pull_request:
+  workflow_call:
 
 permissions:
   contents: read
@@ -25,6 +28,9 @@ jobs:
             Write-Host ('::error title=Windows PowerShell 5.1 test log::' + $escaped)
           }
           exit $testExit
+      - name: Test provider model discovery and catalog isolation
+        shell: powershell
+        run: ./tests/Test-ModelCatalog.ps1
       - name: Scan repository for committed secrets and private paths
         if: always()
         shell: powershell
@@ -47,6 +53,9 @@ jobs:
             Write-Host ('::error title=PowerShell 7 test log::' + $escaped)
           }
           exit $testExit
+      - name: Test provider model discovery and catalog isolation
+        shell: pwsh
+        run: ./tests/Test-ModelCatalog.ps1
       - name: Scan repository for committed secrets and private paths
         if: always()
         shell: pwsh
@@ -60,3 +69,23 @@ jobs:
       - name: Build and self-test the Chinese WinForms executable
         shell: powershell
         run: ./tests/Test-GuiSmoke.ps1
+
+  codex-catalog-integration:
+    runs-on: windows-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v5
+      - name: Install the verified Codex protocol version without API credentials
+        shell: pwsh
+        run: |
+          npm install --global @openai/codex@0.150.1
+          if ($LASTEXITCODE -ne 0) { throw 'Pinned Codex CLI installation failed.' }
+      - name: Verify native model list with Windows PowerShell 5.1
+        shell: powershell
+        run: ./tests/Test-CodexCatalogIntegration.ps1 -RequireCodex -ExpectedCodexVersion 0.150.1
+      - name: Verify native model list with PowerShell 7
+        shell: pwsh
+        run: ./tests/Test-CodexCatalogIntegration.ps1 -RequireCodex -ExpectedCodexVersion 0.150.1
+      - name: Verify generated provider route against local mock only
+        shell: powershell
+        run: ./tests/Test-LocalProviderRoute.ps1
