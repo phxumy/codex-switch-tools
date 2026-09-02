@@ -19,8 +19,8 @@ using System.Web.Script.Serialization;
 [assembly: AssemblyTitle("Codex 配置切换工具")]
 [assembly: AssemblyDescription("中文 Codex Provider、模型、上下文、密钥与备份管理工具")]
 [assembly: AssemblyProduct("Codex Switch Tools")]
-[assembly: AssemblyVersion("1.1.0.0")]
-[assembly: AssemblyFileVersion("1.1.0.0")]
+[assembly: AssemblyVersion("1.1.1.0")]
+[assembly: AssemblyFileVersion("1.1.1.0")]
 
 namespace CodexSwitchToolsGui
 {
@@ -57,6 +57,20 @@ namespace CodexSwitchToolsGui
             int flags,
             int timeout,
             out IntPtr result);
+    }
+
+    internal static class ApplicationResources
+    {
+        private const string IconResourceName = "CodexSwitchTools.AppIcon.ico";
+
+        internal static Icon LoadApplicationIcon()
+        {
+            using (Stream stream = Assembly.GetExecutingAssembly().GetManifestResourceStream(IconResourceName))
+            {
+                if (stream == null) throw new InvalidOperationException("应用图标资源缺失，请重新构建 CodexSwitchTools.exe。");
+                using (var source = new Icon(stream)) return (Icon)source.Clone();
+            }
+        }
     }
 
     internal sealed class PowerShellBridge : IDisposable
@@ -613,6 +627,7 @@ namespace CodexSwitchToolsGui
             testMode = isTestMode;
 
             Text = "Codex 配置切换工具";
+            Icon = ApplicationResources.LoadApplicationIcon();
             StartPosition = FormStartPosition.CenterScreen;
             MinimumSize = new Size(900, 650);
             ClientSize = new Size(940, 680);
@@ -1464,6 +1479,7 @@ namespace CodexSwitchToolsGui
                             {
                                 string[] expectedTabs = { "状态总览", "Provider 与模型", "上下文窗口", "密钥、备份与诊断" };
                                 if (form.TabCountForTest != 4 || !form.TabTitlesForTest.SequenceEqual(expectedTabs)) selfTestCode = 22;
+                                else if (form.Icon == null || form.Icon.Width < 16 || form.Icon.Height < 16) selfTestCode = 27;
                                 else if (!MainForm.RunEnvironmentSynchronizationSelfTest()) selfTestCode = 24;
                             }
                         }

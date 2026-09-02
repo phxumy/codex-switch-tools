@@ -9,6 +9,7 @@ $repositoryRoot = Split-Path -Parent $MyInvocation.MyCommand.Path
 $sourcePath = Join-Path $repositoryRoot 'src\CodexSwitchTools.Gui.cs'
 $manifestPath = Join-Path $repositoryRoot 'src\CodexSwitchTools.Gui.manifest'
 $corePath = Join-Path $repositoryRoot 'Codex-Switch-Tools.ps1'
+$iconPath = Join-Path $repositoryRoot 'assets\CodexSwitchTools.ico'
 
 $writeRepositoryChecksum = [string]::IsNullOrWhiteSpace($OutputPath)
 if ($writeRepositoryChecksum) {
@@ -22,7 +23,7 @@ $compilerCandidates = @(
 $compilerPath = $compilerCandidates | Where-Object { Test-Path -LiteralPath $_ } | Select-Object -First 1
 if (-not $compilerPath) { throw '没有找到 .NET Framework C# 编译器 csc.exe。' }
 
-foreach ($required in @($sourcePath, $manifestPath, $corePath)) {
+foreach ($required in @($sourcePath, $manifestPath, $corePath, $iconPath)) {
     if (-not (Test-Path -LiteralPath $required -PathType Leaf)) { throw "缺少构建文件：$required" }
 }
 
@@ -40,7 +41,9 @@ try {
         /platform:anycpu `
         /target:winexe `
         "/win32manifest:$manifestPath" `
+        "/win32icon:$iconPath" `
         "/resource:$corePath,CodexSwitchTools.Core.ps1" `
+        "/resource:$iconPath,CodexSwitchTools.AppIcon.ico" `
         "/resource:$fingerprintPath,CodexSwitchTools.BuildFingerprint.txt" `
         "/out:$OutputPath" `
         /reference:System.dll `
@@ -59,7 +62,7 @@ try {
 $hash = Get-FileHash -LiteralPath $OutputPath -Algorithm SHA256
 if ($writeRepositoryChecksum) {
     $sumPath = Join-Path $repositoryRoot 'SHA256SUMS.txt'
-    $line = $hash.Hash + '  dist/CodexSwitchTools.exe' + [Environment]::NewLine
+    $line = $hash.Hash + '  dist/CodexSwitchTools.exe' + "`n"
     [IO.File]::WriteAllText($sumPath, $line, [Text.UTF8Encoding]::new($false))
 }
 Write-Host "Built: $OutputPath"

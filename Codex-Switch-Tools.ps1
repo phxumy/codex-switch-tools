@@ -31,7 +31,7 @@ Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 try { [Console]::OutputEncoding = [Text.UTF8Encoding]::new($false) } catch { }
 
-$script:ToolVersion = '1.1.0'
+$script:ToolVersion = '1.1.1'
 $script:EntryExitCode = 0
 $script:ContextMarkerPattern = '^\s*#\s*CST_CONTEXT_V1\s+previous_window=(absent|[0-9_]+)\s+previous_compact=(absent|[0-9_]+)\s*$'
 $script:ReservedProviderIds = @('openai', 'ollama', 'lmstudio')
